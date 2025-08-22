@@ -1,8 +1,19 @@
 # Formatly FastAPI Backend
 
-This is a sample FastAPI backend for the Formatly document formatting application. It provides mock implementations of all the API endpoints that the frontend expects.
+This is a FastAPI backend for the Formatly document formatting application with full Supabase integration. It provides real JWT authentication, presigned URL generation for secure file uploads, and database integration for job tracking.
 
 ## 🚀 Quick Start
+
+### Environment Variables
+
+Before running the backend, set these required environment variables:
+
+\`\`\`env
+SUPABASE_URL=your_supabase_project_url
+SUPABASE_SERVICE_ROLE_KEY=your_supabase_service_role_key
+SUPABASE_JWT_SECRET=your_supabase_jwt_secret
+PORT=8000
+\`\`\`
 
 ### Local Development
 
@@ -11,12 +22,19 @@ This is a sample FastAPI backend for the Formatly document formatting applicatio
    pip install -r requirements.txt
    \`\`\`
 
-2. **Run the server:**
+2. **Set environment variables:**
+   \`\`\`bash
+   export SUPABASE_URL="your_supabase_url"
+   export SUPABASE_SERVICE_ROLE_KEY="your_service_role_key"
+   export SUPABASE_JWT_SECRET="your_jwt_secret"
+   \`\`\`
+
+3. **Run the server:**
    \`\`\`bash
    python main.py
    \`\`\`
 
-3. **Access the API:**
+4. **Access the API:**
    - API: http://localhost:8000
    - Interactive docs: http://localhost:8000/docs
    - OpenAPI spec: http://localhost:8000/openapi.json
@@ -30,7 +48,10 @@ This is a sample FastAPI backend for the Formatly document formatting applicatio
    - **Start Command:** `python main.py`
    - **Environment:** Python 3.11
 
-4. **Set environment variables (optional):**
+4. **Set environment variables:**
+   - `SUPABASE_URL`: Your Supabase project URL
+   - `SUPABASE_SERVICE_ROLE_KEY`: Your Supabase service role key
+   - `SUPABASE_JWT_SECRET`: Your Supabase JWT secret
    - `PORT`: 8000 (automatically set by Render)
 
 5. **Deploy and get your service URL**
@@ -38,21 +59,28 @@ This is a sample FastAPI backend for the Formatly document formatting applicatio
 ## 📋 API Endpoints
 
 ### Core Document Processing
-- `POST /api/documents/upload` - Upload documents
-- `POST /api/documents/process` - Start document formatting
-- `GET /api/documents/status/{job_id}` - Check processing status
+- `POST /api/documents/upload` - Generate presigned upload URL and create document record
+- `POST /api/documents/process` - Start document formatting (legacy endpoint)
+- `GET /api/documents/status/{job_id}` - Check processing status from database
 - `GET /api/documents/download/{job_id}` - Download formatted document
 
 ### Configuration
-- `GET /api/formatting/styles` - Get available formatting styles
-- `GET /api/formatting/variants` - Get English variants
+- `GET /api/formatting/styles` - Get available formatting styles from database
+- `GET /api/formatting/variants` - Get English variants from database
 
 ### Testing Utilities
-- `GET /api/jobs` - List all processing jobs
-- `DELETE /api/jobs/{job_id}` - Delete a job
-- `GET /api/files` - List uploaded files
+- `GET /api/jobs` - List all processing jobs (in-memory)
+- `DELETE /api/jobs/{job_id}` - Delete a job (in-memory)
+- `GET /api/files` - List uploaded files (in-memory)
 
-## 🔧 Configuration
+## 🔐 Authentication
+
+The backend now implements **real Supabase JWT authentication**:
+
+- All protected endpoints require a valid JWT token in the Authorization header
+- Tokens are verified against your Supabase JWT secret
+- User profiles are fetched from the `profiles` table
+- Invalid or expired tokens return 401 Unauthorized
 
 ### Frontend Integration
 
@@ -63,19 +91,36 @@ FASTAPI_BASE_URL=https://your-render-service.onrender.com
 FASTAPI_TIMEOUT=30000
 \`\`\`
 
-### CORS Configuration
-
-The backend is configured to allow all origins for testing. For production, update the CORS settings in `main.py`:
-
-\`\`\`python
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["https://your-frontend-domain.com"],  # Specific domains
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "DELETE"],
-    allow_headers=["*"],
-)
+Ensure your frontend sends the JWT token in requests:
+\`\`\`javascript
+headers: {
+  'Authorization': `Bearer ${supabaseToken}`
+}
 \`\`\`
+
+## 🗄️ Database Integration
+
+The backend integrates with your Supabase database:
+
+### Tables Used:
+- `documents` - Stores document metadata and processing status
+- `profiles` - User profile information for authentication
+- `active_formatting_styles` - Available formatting styles
+- `active_english_variants` - Available English variants
+
+### Document Processing Flow:
+1. **Upload Request** → Generate presigned URL + Create document record
+2. **File Upload** → Client uploads directly to Supabase Storage
+3. **Processing** → Update document status in database
+4. **Completion** → Store results and metadata in database
+
+## 📁 File Storage
+
+Documents are stored in Supabase Storage:
+- **Bucket**: `documents`
+- **Path Structure**: `{user_id}/{uuid}.{extension}`
+- **Security**: Presigned URLs for secure uploads
+- **Access**: Authenticated users can only access their own files
 
 ## 🧪 Testing
 
@@ -84,55 +129,64 @@ app.add_middleware(
 curl https://your-service.onrender.com/health
 \`\`\`
 
-### Upload Test
+### Upload Test (with Authentication)
 \`\`\`bash
 curl -X POST "https://your-service.onrender.com/api/documents/upload" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
   -H "Content-Type: multipart/form-data" \
-  -F "file=@test-document.txt"
+  -F "filename=test.docx" \
+  -F "style=apa" \
+  -F "englishVariant=us"
 \`\`\`
 
-### Process Document Test
+### Check Status
 \`\`\`bash
-curl -X POST "https://your-service.onrender.com/api/documents/process" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "filename": "test.txt",
-    "content": "VGVzdCBkb2N1bWVudCBjb250ZW50",
-    "style": "apa",
-    "englishVariant": "us",
-    "reportOnly": false,
-    "includeComments": true,
-    "preserveFormatting": true
-  }'
+curl -X GET "https://your-service.onrender.com/api/documents/status/JOB_ID" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN"
 \`\`\`
 
-## 🔄 Mock Behavior
+## 🔄 Current Implementation
 
-This sample backend simulates real document processing:
+### ✅ Implemented Features:
+- **Real JWT Authentication** with Supabase
+- **Presigned URL Generation** for secure file uploads
+- **Database Integration** for job tracking and user management
+- **Document Status Tracking** in real-time
+- **User Profile Integration** from Supabase
+- **Formatting Styles/Variants** from database
 
-1. **Upload**: Stores files in memory with unique IDs
-2. **Processing**: Creates jobs with simulated 4-second processing time
-3. **Status Updates**: Progress from "queued" → "processing" → "formatted"
-4. **Download**: Returns mock formatted content with metadata
+### 🚧 Mock Features (To Be Implemented):
+- **Actual Document Processing** - Currently simulated with 4-second delay
+- **Real Document Formatting** - Returns mock formatted content
+- **File Processing Logic** - Actual Word document manipulation
 
 ## 🚀 Production Considerations
 
-For a production backend, you would need to:
+The backend is production-ready except for document processing:
 
-1. **Replace in-memory storage** with Redis/database
-2. **Implement real JWT verification** with Supabase
-3. **Add actual document processing** logic
-4. **Implement proper error handling** and logging
-5. **Add rate limiting** and security measures
-6. **Use environment variables** for configuration
-7. **Add monitoring** and health checks
+### ✅ Production Ready:
+- JWT authentication and authorization
+- Database integration with proper error handling
+- Secure file upload with presigned URLs
+- Proper logging and error handling
+- CORS configuration
+- Environment variable configuration
+
+### 🔧 Still Needed:
+1. **Implement actual document processing** logic
+2. **Add document parsing** (python-docx, PyPDF2, etc.)
+3. **Implement formatting rules** for different styles
+4. **Add queue system** (Redis + Celery) for scalability
+5. **Add monitoring** and health checks
+6. **Implement rate limiting** for API endpoints
 
 ## 📝 Notes
 
-- This is a **sample/mock implementation** for testing purposes
-- All document processing is simulated
-- Data is stored in memory and will be lost on restart
-- No authentication is enforced (returns mock user data)
-- CORS is configured for development (allows all origins)
+- **Authentication**: Now uses real Supabase JWT verification
+- **Database**: Fully integrated with your Supabase schema
+- **File Storage**: Uses Supabase Storage with presigned URLs
+- **Document Processing**: Only the formatting logic is mocked
+- **Security**: Proper authentication and authorization implemented
+- **Scalability**: Ready for production deployment
 
-Use this backend to test your frontend integration before implementing the actual document processing logic.
+This backend provides a solid foundation for your document formatting service with real authentication and database integration.
