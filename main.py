@@ -52,15 +52,19 @@ jobs_storage: Dict[str, Dict[str, Any]] = {}
 files_storage: Dict[str, Dict[str, Any]] = {}
 
 # Pydantic models
-class ProcessDocumentRequest(BaseModel):
+class UploadUrlRequest(BaseModel):
     filename: str
-    content: str  # base64 encoded
+    fileSize: int
+    contentType: str
+
+class ProcessDocumentRequest(BaseModel):
+    jobId: str
+    filename: str
     style: str
     englishVariant: str
     reportOnly: bool = False
-    includeComments: bool = True
-    preserveFormatting: bool = True
-    options: Optional[Dict[str, Any]] = None
+    includeComments: bool = False
+    preserveFormatting: bool = False
 
 class ProcessDocumentResponse(BaseModel):
     success: bool
@@ -387,53 +391,38 @@ async def upload_complete_webhook(
 
 @app.post("/api/documents/upload")
 async def upload_document(
-    filename: str = Form(...),
-    style: str = Form(...),
-    englishVariant: str = Form(...),
-    reportOnly: bool = Form(False),
-    includeComments: bool = Form(True),
-    preserveFormatting: bool = Form(True),
+    request: UploadUrlRequest,
     user: dict = Depends(verify_token)
 ):
-    """EXISTING ENDPOINT: Generate presigned upload URL and create document record - KEPT FOR COMPATIBILITY"""
+    """FIXED ENDPOINT: Generate presigned upload URL - matches frontend expectations"""
     try:
-        logger.info(f"[v0] Document upload request received for file: {filename}")
+        logger.info(f"[v0] Document upload request received for file: {request.filename}")
         
         job_id = str(uuid.uuid4())
         logger.info(f"[v0] Generated job ID: {job_id}")
         
-        # FIXED: Use corrected upload URL generation
+        # Generate signed upload URL
         logger.info(f"[v0] Generating signed upload URL for user: {user['user_id']}")
-        upload_info = await generate_signed_upload_url(filename, user["user_id"])
+        upload_info = await generate_signed_upload_url(request.filename, user["user_id"])
         logger.info(f"[v0] Successfully generated upload URL")
         
-        # Prepare formatting options
-        options = {
-            "reportOnly": reportOnly,
-            "includeComments": includeComments,
-            "preserveFormatting": preserveFormatting
+        # Store job info temporarily (will be completed by process endpoint)
+        jobs_storage[job_id] = {
+            "job_id": job_id,
+            "user_id": user["user_id"],
+            "filename": request.filename,
+            "file_size": request.fileSize,
+            "content_type": request.contentType,
+            "file_path": upload_info["file_path"],
+            "status": "pending_upload",
+            "created_at": datetime.utcnow().isoformat()
         }
         
-        # Create document record in database
-        logger.info(f"[v0] Creating document record in database")
-        await create_document_record(
-            user["user_id"], 
-            filename, 
-            upload_info["file_path"], 
-            job_id, 
-            style, 
-            englishVariant, 
-            options
-        )
-        logger.info(f"[v0] Successfully created document record")
+        logger.info(f"[v0] Upload URL generated successfully for job: {job_id}")
         
         return {
-            "success": True,
-            "job_id": job_id,
-            "upload_url": upload_info["upload_url"],
-            "upload_token": upload_info.get("upload_token", ""),
-            "file_path": upload_info["file_path"],
-            "message": f"Document queued for {style} formatting. Status: DRAFT. Upload your file to begin processing."
+            "uploadUrl": upload_info["upload_url"],
+            "jobId": job_id
         }
     
     except HTTPException:
@@ -447,42 +436,63 @@ async def process_document(
     request: ProcessDocumentRequest,
     user: dict = Depends(verify_token)
 ):
-    """Process a document with formatting (legacy endpoint for backward compatibility)"""
+    """FIXED ENDPOINT: Process uploaded document - matches frontend expectations"""
     try:
-        job_id = str(uuid.uuid4())
+        logger.info(f"[v0] Processing request received for job: {request.jobId}")
         
-        # For backward compatibility, create a document record with base64 content
+        # Get job info from temporary storage
+        if request.jobId not in jobs_storage:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        job_info = jobs_storage[request.jobId]
+        
+        # Verify job belongs to user
+        if job_info["user_id"] != user["user_id"]:
+            raise HTTPException(status_code=403, detail="Access denied")
+        
+        # Create document record in database
         options = {
             "reportOnly": request.reportOnly,
             "includeComments": request.includeComments,
-            "preserveFormatting": request.preserveFormatting,
-            "content": request.content  # Store base64 content temporarily
+            "preserveFormatting": request.preserveFormatting
         }
         
+        logger.info(f"[v0] Creating document record for job: {request.jobId}")
         await create_document_record(
             user["user_id"],
             request.filename,
-            f"legacy/{job_id}",  # Legacy storage path
-            job_id,
+            job_info["file_path"],
+            request.jobId,
             request.style,
             request.englishVariant,
             options
         )
         
-        # Start background processing immediately for legacy endpoint
-        asyncio.create_task(simulate_processing(job_id))
+        # Update job status to processing
+        jobs_storage[request.jobId].update({
+            "status": "processing",
+            "style": request.style,
+            "english_variant": request.englishVariant,
+            "options": options
+        })
         
-        return ProcessDocumentResponse(
-            success=True,
-            job_id=job_id,
-            status="draft",  # Fixed: Use correct status enum
-            message=f"Document queued for {request.style} formatting"
-        )
+        # Start background processing
+        logger.info(f"[v0] Starting background processing for job: {request.jobId}")
+        asyncio.create_task(simulate_processing(request.jobId))
+        
+        logger.info(f"[v0] Processing started successfully for job: {request.jobId}")
+        
+        return {
+            "success": True,
+            "jobId": request.jobId,
+            "status": "processing",
+            "message": f"Document queued for {request.style} formatting"
+        }
     
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Process endpoint error: {str(e)}")
+        logger.error(f"[v0] Process endpoint error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
 
 @app.get("/api/documents/status/{job_id}")
@@ -630,3 +640,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
