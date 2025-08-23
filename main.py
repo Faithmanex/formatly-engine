@@ -52,19 +52,15 @@ jobs_storage: Dict[str, Dict[str, Any]] = {}
 files_storage: Dict[str, Dict[str, Any]] = {}
 
 # Pydantic models
-class UploadUrlRequest(BaseModel):
-    filename: str
-    fileSize: int
-    contentType: str
-
 class ProcessDocumentRequest(BaseModel):
-    jobId: str
     filename: str
+    content: str  # base64 encoded
     style: str
     englishVariant: str
     reportOnly: bool = False
-    includeComments: bool = False
-    preserveFormatting: bool = False
+    includeComments: bool = True
+    preserveFormatting: bool = True
+    options: Optional[Dict[str, Any]] = None
 
 class ProcessDocumentResponse(BaseModel):
     success: bool
@@ -173,11 +169,8 @@ async def generate_signed_upload_url(filename: str, user_id: str) -> Dict[str, s
         file_extension = filename.split('.')[-1].lower() if '.' in filename else 'docx'
         unique_filename = f"{user_id}/{uuid.uuid4()}.{file_extension}"
         
-        response = supabase.storage.from_("documents").create_signed_url(
-            unique_filename, 
-            expires_in=3600,  # 1 hour expiration
-            options={"upsert": True}  # Allow uploads/overwrites
-        )
+        # FIXED: Use correct Supabase method for signed upload URL
+        response = supabase.storage.from_("documents").create_signed_upload_url(unique_filename)
         
         if not response or not response.get("signedURL"):
             raise Exception("Failed to generate signed upload URL")
@@ -192,6 +185,7 @@ async def generate_signed_upload_url(filename: str, user_id: str) -> Dict[str, s
         logger.error(f"Error generating signed upload URL: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to generate upload URL: {str(e)}")
 
+# Keep the old function for backward compatibility if needed
 async def generate_presigned_upload_url(filename: str, user_id: str) -> Dict[str, str]:
     """Legacy function - redirects to corrected version"""
     return await generate_signed_upload_url(filename, user_id)
@@ -204,7 +198,7 @@ async def create_document_record(user_id: str, filename: str, file_path: str, jo
             "user_id": user_id,
             "filename": filename,
             "original_filename": filename,
-            "status": "draft",  # Fixed: Use correct database enum value
+            "status": "draft",  # FIXED: Use correct database enum value
             "style_applied": style,
             "language_variant": language_variant,
             "storage_location": file_path,
@@ -391,44 +385,55 @@ async def upload_complete_webhook(
 
 @app.post("/api/documents/upload")
 async def upload_document(
-    request: UploadUrlRequest,
+    filename: str = Form(...),
+    style: str = Form(...),
+    englishVariant: str = Form(...),
+    reportOnly: bool = Form(False),
+    includeComments: bool = Form(True),
+    preserveFormatting: bool = Form(True),
     user: dict = Depends(verify_token)
 ):
-    """FIXED ENDPOINT: Generate presigned upload URL - matches frontend expectations"""
+    """EXISTING ENDPOINT: Generate presigned upload URL and create document record - KEPT FOR COMPATIBILITY"""
     try:
-        logger.info(f"[v0] Document upload request received for file: {request.filename}")
-        
         job_id = str(uuid.uuid4())
-        logger.info(f"[v0] Generated job ID: {job_id}")
         
-        # Generate signed upload URL
-        logger.info(f"[v0] Generating signed upload URL for user: {user['user_id']}")
-        upload_info = await generate_signed_upload_url(request.filename, user["user_id"])
-        logger.info(f"[v0] Successfully generated upload URL")
+        # FIXED: Use corrected upload URL generation
+        upload_info = await generate_signed_upload_url(filename, user["user_id"])
         
-        # Store job info temporarily (will be completed by process endpoint)
-        jobs_storage[job_id] = {
-            "job_id": job_id,
-            "user_id": user["user_id"],
-            "filename": request.filename,
-            "file_size": request.fileSize,
-            "content_type": request.contentType,
-            "file_path": upload_info["file_path"],
-            "status": "pending_upload",
-            "created_at": datetime.utcnow().isoformat()
+        # Prepare formatting options
+        options = {
+            "reportOnly": reportOnly,
+            "includeComments": includeComments,
+            "preserveFormatting": preserveFormatting
         }
         
-        logger.info(f"[v0] Upload URL generated successfully for job: {job_id}")
+        # Create document record in database
+        await create_document_record(
+            user["user_id"], 
+            filename, 
+            upload_info["file_path"], 
+            job_id, 
+            style, 
+            englishVariant, 
+            options
+        )
+        
+        # NOTE: Removed auto-processing start - should wait for upload confirmation
+        # asyncio.create_task(simulate_processing(job_id))  # COMMENTED OUT
         
         return {
-            "uploadUrl": upload_info["upload_url"],
-            "jobId": job_id
+            "success": True,
+            "job_id": job_id,
+            "upload_url": upload_info["upload_url"],
+            "upload_token": upload_info.get("upload_token", ""),  # ADDED: Include upload token
+            "file_path": upload_info["file_path"],
+            "message": f"Document queued for {style} formatting. Status: DRAFT. Upload your file to begin processing."
         }
     
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"[v0] Upload endpoint error: {str(e)}")
+        logger.error(f"Upload endpoint error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 @app.post("/api/documents/process")
@@ -436,63 +441,42 @@ async def process_document(
     request: ProcessDocumentRequest,
     user: dict = Depends(verify_token)
 ):
-    """FIXED ENDPOINT: Process uploaded document - matches frontend expectations"""
+    """Process a document with formatting (legacy endpoint for backward compatibility)"""
     try:
-        logger.info(f"[v0] Processing request received for job: {request.jobId}")
+        job_id = str(uuid.uuid4())
         
-        # Get job info from temporary storage
-        if request.jobId not in jobs_storage:
-            raise HTTPException(status_code=404, detail="Job not found")
-        
-        job_info = jobs_storage[request.jobId]
-        
-        # Verify job belongs to user
-        if job_info["user_id"] != user["user_id"]:
-            raise HTTPException(status_code=403, detail="Access denied")
-        
-        # Create document record in database
+        # For backward compatibility, create a document record with base64 content
         options = {
             "reportOnly": request.reportOnly,
             "includeComments": request.includeComments,
-            "preserveFormatting": request.preserveFormatting
+            "preserveFormatting": request.preserveFormatting,
+            "content": request.content  # Store base64 content temporarily
         }
         
-        logger.info(f"[v0] Creating document record for job: {request.jobId}")
         await create_document_record(
             user["user_id"],
             request.filename,
-            job_info["file_path"],
-            request.jobId,
+            f"legacy/{job_id}",  # Legacy storage path
+            job_id,
             request.style,
             request.englishVariant,
             options
         )
         
-        # Update job status to processing
-        jobs_storage[request.jobId].update({
-            "status": "processing",
-            "style": request.style,
-            "english_variant": request.englishVariant,
-            "options": options
-        })
+        # Start background processing immediately for legacy endpoint
+        asyncio.create_task(simulate_processing(job_id))
         
-        # Start background processing
-        logger.info(f"[v0] Starting background processing for job: {request.jobId}")
-        asyncio.create_task(simulate_processing(request.jobId))
-        
-        logger.info(f"[v0] Processing started successfully for job: {request.jobId}")
-        
-        return {
-            "success": True,
-            "jobId": request.jobId,
-            "status": "processing",
-            "message": f"Document queued for {request.style} formatting"
-        }
+        return ProcessDocumentResponse(
+            success=True,
+            job_id=job_id,
+            status="draft",  # FIXED: Use correct status enum
+            message=f"Document queued for {request.style} formatting"
+        )
     
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"[v0] Process endpoint error: {str(e)}")
+        logger.error(f"Process endpoint error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
 
 @app.get("/api/documents/status/{job_id}")
@@ -640,4 +624,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
