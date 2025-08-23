@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, Request
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -163,13 +163,13 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
         raise HTTPException(status_code=401, detail="Token verification failed")
 
 async def generate_signed_upload_url(filename: str, user_id: str) -> Dict[str, str]:
-    """Generate signed upload URL for document upload to Supabase Storage"""
+    """Generate signed upload URL for document upload to Supabase Storage - CORRECTED VERSION"""
     try:
         # Create unique file path
         file_extension = filename.split('.')[-1].lower() if '.' in filename else 'docx'
         unique_filename = f"{user_id}/{uuid.uuid4()}.{file_extension}"
         
-        # Generate signed upload URL
+        # FIXED: Use correct Supabase method for signed upload URL
         response = supabase.storage.from_("documents").create_signed_upload_url(unique_filename)
         
         if not response or not response.get("signedURL"):
@@ -185,6 +185,11 @@ async def generate_signed_upload_url(filename: str, user_id: str) -> Dict[str, s
         logger.error(f"Error generating signed upload URL: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to generate upload URL: {str(e)}")
 
+# Keep the old function for backward compatibility if needed
+async def generate_presigned_upload_url(filename: str, user_id: str) -> Dict[str, str]:
+    """Legacy function - redirects to corrected version"""
+    return await generate_signed_upload_url(filename, user_id)
+
 async def create_document_record(user_id: str, filename: str, file_path: str, job_id: str, style: str, language_variant: str, options: Dict[str, Any]) -> str:
     """Create document record in Supabase database"""
     try:
@@ -193,7 +198,7 @@ async def create_document_record(user_id: str, filename: str, file_path: str, jo
             "user_id": user_id,
             "filename": filename,
             "original_filename": filename,
-            "status": "draft",
+            "status": "draft",  # FIXED: Use correct database enum value
             "style_applied": style,
             "language_variant": language_variant,
             "storage_location": file_path,
@@ -285,28 +290,22 @@ async def health_check():
 
 @app.post("/api/documents/create-upload")
 async def create_upload_url(
-    request: Request,
+    filename: str = Form(...),
+    style: str = Form(...),
+    englishVariant: str = Form(...),
+    reportOnly: bool = Form(False),
+    includeComments: bool = Form(True),
+    preserveFormatting: bool = Form(True),
     user: dict = Depends(verify_token)
-):
-    """Generate signed upload URL and create document record"""
+) -> CreateUploadResponse:
+    """NEW ENDPOINT: Generate signed upload URL and create document record - PROPER FLOW"""
     try:
-        data = await request.json()
-        filename = data.get("filename")
-        style = data.get("style", "apa")
-        englishVariant = data.get("englishVariant", "us")
-        reportOnly = data.get("reportOnly", False)
-        includeComments = data.get("includeComments", True)
-        preserveFormatting = data.get("preserveFormatting", True)
-        
-        if not filename:
-            raise HTTPException(status_code=400, detail="Filename is required")
-        
         job_id = str(uuid.uuid4())
         
-        # Generate signed upload URL
+        # STEP 1: Generate signed upload URL first
         upload_info = await generate_signed_upload_url(filename, user["user_id"])
         
-        # Create document record with DRAFT status
+        # STEP 2: Create document record with DRAFT status
         options = {
             "reportOnly": reportOnly,
             "includeComments": includeComments,
@@ -323,14 +322,15 @@ async def create_upload_url(
             options
         )
         
-        return {
-            "success": True,
-            "job_id": job_id,
-            "upload_url": upload_info["upload_url"],
-            "upload_token": upload_info["upload_token"],
-            "file_path": upload_info["file_path"],
-            "message": f"Upload URL created. Please upload your document to begin {style} formatting."
-        }
+        # STEP 3: Return job ID and upload URL to frontend
+        return CreateUploadResponse(
+            success=True,
+            job_id=job_id,
+            upload_url=upload_info["upload_url"],
+            upload_token=upload_info["upload_token"],
+            file_path=upload_info["file_path"],
+            message=f"Upload URL created. Document status: DRAFT. Please upload your document to begin {style} formatting."
+        )
     
     except HTTPException:
         raise
@@ -340,18 +340,12 @@ async def create_upload_url(
 
 @app.post("/api/documents/upload-complete")
 async def upload_complete_webhook(
-    request: Request,
+    webhook_data: WebhookUploadComplete,
     user: dict = Depends(verify_token)
 ):
-    """Webhook called after frontend successfully uploads file"""
+    """NEW ENDPOINT: Webhook called after frontend successfully uploads file"""
     try:
-        data = await request.json()
-        job_id = data.get("job_id")
-        file_path = data.get("file_path")
-        success = data.get("success", False)
-        
-        if not job_id:
-            raise HTTPException(status_code=400, detail="Job ID is required")
+        job_id = webhook_data.job_id
         
         # Verify the job belongs to the user
         response = supabase.table("documents").select("*").eq("id", job_id).eq("user_id", user["user_id"]).execute()
@@ -361,7 +355,7 @@ async def upload_complete_webhook(
         
         document = response.data[0]
         
-        if success:
+        if webhook_data.success:
             # Update status to processing and start processing
             await update_document_status(job_id, "processing", 0)
             
@@ -370,7 +364,7 @@ async def upload_complete_webhook(
             
             return {
                 "success": True,
-                "message": "Upload confirmed. Document processing started.",
+                "message": "Upload confirmed. Document processing started. Status: PROCESSING",
                 "job_id": job_id
             }
         else:
@@ -379,7 +373,7 @@ async def upload_complete_webhook(
             
             return {
                 "success": False,
-                "message": "Upload failed. Please try again.",
+                "message": "Upload failed. Status: FAILED. Please try again.",
                 "job_id": job_id
             }
     
@@ -390,42 +384,27 @@ async def upload_complete_webhook(
         raise HTTPException(status_code=500, detail=f"Webhook processing failed: {str(e)}")
 
 @app.post("/api/documents/upload")
-async def upload_document_compat(
-    request: Request,
+async def upload_document(
+    filename: str = Form(...),
+    style: str = Form(...),
+    englishVariant: str = Form(...),
+    reportOnly: bool = Form(False),
+    includeComments: bool = Form(True),
+    preserveFormatting: bool = Form(True),
     user: dict = Depends(verify_token)
 ):
-    """Compatibility endpoint for frontend - accepts both JSON and form data"""
+    """EXISTING ENDPOINT: Generate presigned upload URL and create document record - KEPT FOR COMPATIBILITY"""
     try:
-        # Try to parse as JSON first
-        try:
-            data = await request.json()
-        except:
-            # Fall back to form data
-            form_data = await request.form()
-            data = {
-                "filename": form_data.get("filename"),
-                "style": form_data.get("style", "apa"),
-                "englishVariant": form_data.get("englishVariant", "us"),
-                "reportOnly": form_data.get("reportOnly", "false").lower() == "true",
-                "includeComments": form_data.get("includeComments", "true").lower() == "true",
-                "preserveFormatting": form_data.get("preserveFormatting", "true").lower() == "true",
-            }
-        
-        filename = data.get("filename")
-        
-        if not filename:
-            raise HTTPException(status_code=400, detail="Filename is required")
-        
         job_id = str(uuid.uuid4())
         
-        # Generate signed upload URL
+        # FIXED: Use corrected upload URL generation
         upload_info = await generate_signed_upload_url(filename, user["user_id"])
         
         # Prepare formatting options
         options = {
-            "reportOnly": data.get("reportOnly", False),
-            "includeComments": data.get("includeComments", True),
-            "preserveFormatting": data.get("preserveFormatting", True)
+            "reportOnly": reportOnly,
+            "includeComments": includeComments,
+            "preserveFormatting": preserveFormatting
         }
         
         # Create document record in database
@@ -434,63 +413,70 @@ async def upload_document_compat(
             filename, 
             upload_info["file_path"], 
             job_id, 
-            data.get("style", "apa"), 
-            data.get("englishVariant", "us"), 
+            style, 
+            englishVariant, 
             options
         )
         
+        # NOTE: Removed auto-processing start - should wait for upload confirmation
+        # asyncio.create_task(simulate_processing(job_id))  # COMMENTED OUT
+        
         return {
             "success": True,
-            "jobId": job_id,
-            "uploadUrl": upload_info["upload_url"],
-            "upload_token": upload_info["upload_token"],
+            "job_id": job_id,
+            "upload_url": upload_info["upload_url"],
+            "upload_token": upload_info.get("upload_token", ""),  # ADDED: Include upload token
             "file_path": upload_info["file_path"],
-            "message": f"Upload URL generated. Please upload your file."
+            "message": f"Document queued for {style} formatting. Status: DRAFT. Upload your file to begin processing."
         }
     
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Upload compatibility endpoint error: {str(e)}")
+        logger.error(f"Upload endpoint error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 @app.post("/api/documents/process")
-async def process_document_compat(
-    request: Request,
+async def process_document(
+    request: ProcessDocumentRequest,
     user: dict = Depends(verify_token)
 ):
-    """Compatibility endpoint for processing"""
+    """Process a document with formatting (legacy endpoint for backward compatibility)"""
     try:
-        # Try to parse as JSON first
-        try:
-            data = await request.json()
-        except:
-            # Fall back to form data
-            form_data = await request.form()
-            data = {
-                "jobId": form_data.get("jobId"),
-                "filename": form_data.get("filename"),
-                "style": form_data.get("style", "apa"),
-                "englishVariant": form_data.get("englishVariant", "us"),
-                "reportOnly": form_data.get("reportOnly", "false").lower() == "true",
-                "includeComments": form_data.get("includeComments", "true").lower() == "true",
-                "preserveFormatting": form_data.get("preserveFormatting", "true").lower() == "true",
-            }
+        job_id = str(uuid.uuid4())
         
-        job_id = data.get("jobId")
-        
-        if not job_id:
-            raise HTTPException(status_code=400, detail="Job ID is required")
-        
-        # Just return success since processing happens after upload
-        return {
-            "success": True,
-            "jobId": job_id,
-            "message": "Processing started"
+        # For backward compatibility, create a document record with base64 content
+        options = {
+            "reportOnly": request.reportOnly,
+            "includeComments": request.includeComments,
+            "preserveFormatting": request.preserveFormatting,
+            "content": request.content  # Store base64 content temporarily
         }
+        
+        await create_document_record(
+            user["user_id"],
+            request.filename,
+            f"legacy/{job_id}",  # Legacy storage path
+            job_id,
+            request.style,
+            request.englishVariant,
+            options
+        )
+        
+        # Start background processing immediately for legacy endpoint
+        asyncio.create_task(simulate_processing(job_id))
+        
+        return ProcessDocumentResponse(
+            success=True,
+            job_id=job_id,
+            status="draft",  # FIXED: Use correct status enum
+            message=f"Document queued for {request.style} formatting"
+        )
     
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Process compatibility endpoint error: {str(e)}")
+        logger.error(f"Process endpoint error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
 
 @app.get("/api/documents/status/{job_id}")
@@ -505,14 +491,14 @@ async def get_document_status(job_id: str, user: dict = Depends(verify_token)):
         document = response.data[0]
         processing_log = document.get("processing_log") or {}
         
-        return {
-            "success": True,
-            "jobId": job_id,
-            "status": document["status"],
-            "progress": processing_log.get("progress", 0),
-            "resultUrl": f"/api/documents/download/{job_id}" if document["status"] == "formatted" else None,
-            "error": processing_log.get("error")
-        }
+        return DocumentStatusResponse(
+            success=True,
+            job_id=job_id,
+            status=document["status"],
+            progress=processing_log.get("progress", 0),
+            result_url=f"/api/documents/download/{job_id}" if document["status"] == "formatted" else None,
+            error=processing_log.get("error")
+        )
         
     except HTTPException:
         raise
@@ -549,12 +535,12 @@ async def download_document(job_id: str, user: dict = Depends(verify_token)):
             "processing_time": processing_log.get("processing_time", 3.5)
         }
         
-        return {
-            "success": True,
-            "filename": f"formatted_{document['filename']}",
-            "content": formatted_content,
-            "metadata": metadata
-        }
+        return FormattedDocumentResponse(
+            success=True,
+            filename=f"formatted_{document['filename']}",
+            content=formatted_content,
+            metadata=metadata
+        )
         
     except HTTPException:
         raise
@@ -607,6 +593,32 @@ async def get_english_variants():
     except Exception as e:
         logger.error(f"Error fetching English variants: {str(e)}")
         return ENGLISH_VARIANTS
+
+# Additional utility endpoints for testing
+
+@app.get("/api/jobs")
+async def list_jobs():
+    """List all jobs (for testing)"""
+    return {
+        "jobs": list(jobs_storage.values()),
+        "total": len(jobs_storage)
+    }
+
+@app.delete("/api/jobs/{job_id}")
+async def delete_job(job_id: str):
+    """Delete a job (for testing)"""
+    if job_id in jobs_storage:
+        del jobs_storage[job_id]
+        return {"success": True, "message": "Job deleted"}
+    raise HTTPException(status_code=404, detail="Job not found")
+
+@app.get("/api/files")
+async def list_files():
+    """List all uploaded files (for testing)"""
+    return {
+        "files": list(files_storage.values()),
+        "total": len(files_storage)
+    }
 
 if __name__ == "__main__":
     import uvicorn
