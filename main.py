@@ -68,6 +68,19 @@ class ProcessDocumentResponse(BaseModel):
     status: str
     message: str
 
+class CreateUploadResponse(BaseModel):
+    success: bool
+    job_id: str
+    upload_url: str
+    upload_token: str
+    file_path: str
+    message: str
+
+class WebhookUploadComplete(BaseModel):
+    job_id: str
+    file_path: str
+    success: bool
+
 class DocumentStatusResponse(BaseModel):
     success: bool
     job_id: str
@@ -149,28 +162,33 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
         logger.error(f"Token verification error: {str(e)}")
         raise HTTPException(status_code=401, detail="Token verification failed")
 
-async def generate_presigned_upload_url(filename: str, user_id: str) -> Dict[str, str]:
-    """Generate presigned URL for document upload to Supabase Storage"""
+async def generate_signed_upload_url(filename: str, user_id: str) -> Dict[str, str]:
+    """Generate signed upload URL for document upload to Supabase Storage - CORRECTED VERSION"""
     try:
         # Create unique file path
-        file_extension = filename.split('.')[-1] if '.' in filename else 'docx'
+        file_extension = filename.split('.')[-1].lower() if '.' in filename else 'docx'
         unique_filename = f"{user_id}/{uuid.uuid4()}.{file_extension}"
         
-        # Generate presigned URL for upload (expires in 1 hour)
+        # FIXED: Use correct Supabase method for signed upload URL
         response = supabase.storage.from_("documents").create_signed_upload_url(unique_filename)
         
-        if not response:
-            raise Exception("Failed to generate presigned URL")
+        if not response or not response.get("signedURL"):
+            raise Exception("Failed to generate signed upload URL")
         
         return {
-            "upload_url": response.get("signedURL"),
+            "upload_url": response["signedURL"],
             "file_path": unique_filename,
-            "token": response.get("token")
+            "upload_token": response.get("token", "")
         }
         
     except Exception as e:
-        logger.error(f"Error generating presigned URL: {str(e)}")
+        logger.error(f"Error generating signed upload URL: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to generate upload URL: {str(e)}")
+
+# Keep the old function for backward compatibility if needed
+async def generate_presigned_upload_url(filename: str, user_id: str) -> Dict[str, str]:
+    """Legacy function - redirects to corrected version"""
+    return await generate_signed_upload_url(filename, user_id)
 
 async def create_document_record(user_id: str, filename: str, file_path: str, job_id: str, style: str, language_variant: str, options: Dict[str, Any]) -> str:
     """Create document record in Supabase database"""
@@ -180,13 +198,13 @@ async def create_document_record(user_id: str, filename: str, file_path: str, jo
             "user_id": user_id,
             "filename": filename,
             "original_filename": filename,
-            "status": "pending",
+            "status": "draft",  # FIXED: Use correct database enum value
             "style_applied": style,
             "language_variant": language_variant,
             "storage_location": file_path,
             "formatting_options": options,
             "report_only": options.get("reportOnly", False),
-            "file_type": filename.split('.')[-1] if '.' in filename else "docx",
+            "file_type": filename.split('.')[-1].lower() if '.' in filename else "docx",
             "created_at": datetime.utcnow().isoformat(),
             "updated_at": datetime.utcnow().isoformat()
         }
@@ -270,6 +288,101 @@ async def root():
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
+@app.post("/api/documents/create-upload")
+async def create_upload_url(
+    filename: str = Form(...),
+    style: str = Form(...),
+    englishVariant: str = Form(...),
+    reportOnly: bool = Form(False),
+    includeComments: bool = Form(True),
+    preserveFormatting: bool = Form(True),
+    user: dict = Depends(verify_token)
+) -> CreateUploadResponse:
+    """NEW ENDPOINT: Generate signed upload URL and create document record - PROPER FLOW"""
+    try:
+        job_id = str(uuid.uuid4())
+        
+        # STEP 1: Generate signed upload URL first
+        upload_info = await generate_signed_upload_url(filename, user["user_id"])
+        
+        # STEP 2: Create document record with DRAFT status
+        options = {
+            "reportOnly": reportOnly,
+            "includeComments": includeComments,
+            "preserveFormatting": preserveFormatting
+        }
+        
+        await create_document_record(
+            user["user_id"], 
+            filename, 
+            upload_info["file_path"], 
+            job_id, 
+            style, 
+            englishVariant, 
+            options
+        )
+        
+        # STEP 3: Return job ID and upload URL to frontend
+        return CreateUploadResponse(
+            success=True,
+            job_id=job_id,
+            upload_url=upload_info["upload_url"],
+            upload_token=upload_info["upload_token"],
+            file_path=upload_info["file_path"],
+            message=f"Upload URL created. Document status: DRAFT. Please upload your document to begin {style} formatting."
+        )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Create upload URL error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to create upload URL: {str(e)}")
+
+@app.post("/api/documents/upload-complete")
+async def upload_complete_webhook(
+    webhook_data: WebhookUploadComplete,
+    user: dict = Depends(verify_token)
+):
+    """NEW ENDPOINT: Webhook called after frontend successfully uploads file"""
+    try:
+        job_id = webhook_data.job_id
+        
+        # Verify the job belongs to the user
+        response = supabase.table("documents").select("*").eq("id", job_id).eq("user_id", user["user_id"]).execute()
+        
+        if not response.data:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        document = response.data[0]
+        
+        if webhook_data.success:
+            # Update status to processing and start processing
+            await update_document_status(job_id, "processing", 0)
+            
+            # Start background processing
+            asyncio.create_task(simulate_processing(job_id))
+            
+            return {
+                "success": True,
+                "message": "Upload confirmed. Document processing started. Status: PROCESSING",
+                "job_id": job_id
+            }
+        else:
+            # Upload failed
+            await update_document_status(job_id, "failed", processing_log={"error": "File upload failed"})
+            
+            return {
+                "success": False,
+                "message": "Upload failed. Status: FAILED. Please try again.",
+                "job_id": job_id
+            }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Upload complete webhook error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Webhook processing failed: {str(e)}")
+
 @app.post("/api/documents/upload")
 async def upload_document(
     filename: str = Form(...),
@@ -280,12 +393,12 @@ async def upload_document(
     preserveFormatting: bool = Form(True),
     user: dict = Depends(verify_token)
 ):
-    """Generate presigned upload URL and create document record"""
+    """EXISTING ENDPOINT: Generate presigned upload URL and create document record - KEPT FOR COMPATIBILITY"""
     try:
         job_id = str(uuid.uuid4())
         
-        # Generate presigned upload URL
-        upload_info = await generate_presigned_upload_url(filename, user["user_id"])
+        # FIXED: Use corrected upload URL generation
+        upload_info = await generate_signed_upload_url(filename, user["user_id"])
         
         # Prepare formatting options
         options = {
@@ -305,15 +418,16 @@ async def upload_document(
             options
         )
         
-        # Start background processing simulation
-        asyncio.create_task(simulate_processing(job_id))
+        # NOTE: Removed auto-processing start - should wait for upload confirmation
+        # asyncio.create_task(simulate_processing(job_id))  # COMMENTED OUT
         
         return {
             "success": True,
             "job_id": job_id,
             "upload_url": upload_info["upload_url"],
+            "upload_token": upload_info.get("upload_token", ""),  # ADDED: Include upload token
             "file_path": upload_info["file_path"],
-            "message": f"Document queued for {style} formatting"
+            "message": f"Document queued for {style} formatting. Status: DRAFT. Upload your file to begin processing."
         }
     
     except HTTPException:
@@ -349,13 +463,13 @@ async def process_document(
             options
         )
         
-        # Start background processing
+        # Start background processing immediately for legacy endpoint
         asyncio.create_task(simulate_processing(job_id))
         
         return ProcessDocumentResponse(
             success=True,
             job_id=job_id,
-            status="queued",
+            status="draft",  # FIXED: Use correct status enum
             message=f"Document queued for {request.style} formatting"
         )
     
