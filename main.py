@@ -287,7 +287,7 @@ async def health_check():
 async def create_upload_url(
     request: Request,
     user: dict = Depends(verify_token)
-) -> CreateUploadResponse:
+):
     """Generate signed upload URL and create document record"""
     try:
         data = await request.json()
@@ -323,14 +323,14 @@ async def create_upload_url(
             options
         )
         
-        return CreateUploadResponse(
-            success=True,
-            job_id=job_id,
-            upload_url=upload_info["upload_url"],
-            upload_token=upload_info["upload_token"],
-            file_path=upload_info["file_path"],
-            message=f"Upload URL created. Please upload your document to begin {style} formatting."
-        )
+        return {
+            "success": True,
+            "job_id": job_id,
+            "upload_url": upload_info["upload_url"],
+            "upload_token": upload_info["upload_token"],
+            "file_path": upload_info["file_path"],
+            "message": f"Upload URL created. Please upload your document to begin {style} formatting."
+        }
     
     except HTTPException:
         raise
@@ -394,9 +394,23 @@ async def upload_document_compat(
     request: Request,
     user: dict = Depends(verify_token)
 ):
-    """Compatibility endpoint for frontend"""
+    """Compatibility endpoint for frontend - accepts both JSON and form data"""
     try:
-        data = await request.json()
+        # Try to parse as JSON first
+        try:
+            data = await request.json()
+        except:
+            # Fall back to form data
+            form_data = await request.form()
+            data = {
+                "filename": form_data.get("filename"),
+                "style": form_data.get("style", "apa"),
+                "englishVariant": form_data.get("englishVariant", "us"),
+                "reportOnly": form_data.get("reportOnly", "false").lower() == "true",
+                "includeComments": form_data.get("includeComments", "true").lower() == "true",
+                "preserveFormatting": form_data.get("preserveFormatting", "true").lower() == "true",
+            }
+        
         filename = data.get("filename")
         
         if not filename:
@@ -427,7 +441,7 @@ async def upload_document_compat(
         
         return {
             "success": True,
-            "job_id": job_id,
+            "jobId": job_id,
             "uploadUrl": upload_info["upload_url"],
             "upload_token": upload_info["upload_token"],
             "file_path": upload_info["file_path"],
@@ -447,7 +461,22 @@ async def process_document_compat(
 ):
     """Compatibility endpoint for processing"""
     try:
-        data = await request.json()
+        # Try to parse as JSON first
+        try:
+            data = await request.json()
+        except:
+            # Fall back to form data
+            form_data = await request.form()
+            data = {
+                "jobId": form_data.get("jobId"),
+                "filename": form_data.get("filename"),
+                "style": form_data.get("style", "apa"),
+                "englishVariant": form_data.get("englishVariant", "us"),
+                "reportOnly": form_data.get("reportOnly", "false").lower() == "true",
+                "includeComments": form_data.get("includeComments", "true").lower() == "true",
+                "preserveFormatting": form_data.get("preserveFormatting", "true").lower() == "true",
+            }
+        
         job_id = data.get("jobId")
         
         if not job_id:
@@ -456,7 +485,7 @@ async def process_document_compat(
         # Just return success since processing happens after upload
         return {
             "success": True,
-            "job_id": job_id,
+            "jobId": job_id,
             "message": "Processing started"
         }
     
@@ -476,14 +505,14 @@ async def get_document_status(job_id: str, user: dict = Depends(verify_token)):
         document = response.data[0]
         processing_log = document.get("processing_log") or {}
         
-        return DocumentStatusResponse(
-            success=True,
-            job_id=job_id,
-            status=document["status"],
-            progress=processing_log.get("progress", 0),
-            result_url=f"/api/documents/download/{job_id}" if document["status"] == "formatted" else None,
-            error=processing_log.get("error")
-        )
+        return {
+            "success": True,
+            "jobId": job_id,
+            "status": document["status"],
+            "progress": processing_log.get("progress", 0),
+            "resultUrl": f"/api/documents/download/{job_id}" if document["status"] == "formatted" else None,
+            "error": processing_log.get("error")
+        }
         
     except HTTPException:
         raise
@@ -520,12 +549,12 @@ async def download_document(job_id: str, user: dict = Depends(verify_token)):
             "processing_time": processing_log.get("processing_time", 3.5)
         }
         
-        return FormattedDocumentResponse(
-            success=True,
-            filename=f"formatted_{document['filename']}",
-            content=formatted_content,
-            metadata=metadata
-        )
+        return {
+            "success": True,
+            "filename": f"formatted_{document['filename']}",
+            "content": formatted_content,
+            "metadata": metadata
+        }
         
     except HTTPException:
         raise
