@@ -169,8 +169,11 @@ async def generate_signed_upload_url(filename: str, user_id: str) -> Dict[str, s
         file_extension = filename.split('.')[-1].lower() if '.' in filename else 'docx'
         unique_filename = f"{user_id}/{uuid.uuid4()}.{file_extension}"
         
-        # FIXED: Use correct Supabase method for signed upload URL
-        response = supabase.storage.from_("documents").create_signed_upload_url(unique_filename)
+        response = supabase.storage.from_("documents").create_signed_url(
+            unique_filename, 
+            expires_in=3600,  # 1 hour expiration
+            options={"upsert": True}  # Allow uploads/overwrites
+        )
         
         if not response or not response.get("signedURL"):
             raise Exception("Failed to generate signed upload URL")
@@ -185,7 +188,6 @@ async def generate_signed_upload_url(filename: str, user_id: str) -> Dict[str, s
         logger.error(f"Error generating signed upload URL: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to generate upload URL: {str(e)}")
 
-# Keep the old function for backward compatibility if needed
 async def generate_presigned_upload_url(filename: str, user_id: str) -> Dict[str, str]:
     """Legacy function - redirects to corrected version"""
     return await generate_signed_upload_url(filename, user_id)
@@ -198,7 +200,7 @@ async def create_document_record(user_id: str, filename: str, file_path: str, jo
             "user_id": user_id,
             "filename": filename,
             "original_filename": filename,
-            "status": "draft",  # FIXED: Use correct database enum value
+            "status": "draft",  # Fixed: Use correct database enum value
             "style_applied": style,
             "language_variant": language_variant,
             "storage_location": file_path,
@@ -395,10 +397,15 @@ async def upload_document(
 ):
     """EXISTING ENDPOINT: Generate presigned upload URL and create document record - KEPT FOR COMPATIBILITY"""
     try:
+        logger.info(f"[v0] Document upload request received for file: {filename}")
+        
         job_id = str(uuid.uuid4())
+        logger.info(f"[v0] Generated job ID: {job_id}")
         
         # FIXED: Use corrected upload URL generation
+        logger.info(f"[v0] Generating signed upload URL for user: {user['user_id']}")
         upload_info = await generate_signed_upload_url(filename, user["user_id"])
+        logger.info(f"[v0] Successfully generated upload URL")
         
         # Prepare formatting options
         options = {
@@ -408,6 +415,7 @@ async def upload_document(
         }
         
         # Create document record in database
+        logger.info(f"[v0] Creating document record in database")
         await create_document_record(
             user["user_id"], 
             filename, 
@@ -417,15 +425,13 @@ async def upload_document(
             englishVariant, 
             options
         )
-        
-        # NOTE: Removed auto-processing start - should wait for upload confirmation
-        # asyncio.create_task(simulate_processing(job_id))  # COMMENTED OUT
+        logger.info(f"[v0] Successfully created document record")
         
         return {
             "success": True,
             "job_id": job_id,
             "upload_url": upload_info["upload_url"],
-            "upload_token": upload_info.get("upload_token", ""),  # ADDED: Include upload token
+            "upload_token": upload_info.get("upload_token", ""),
             "file_path": upload_info["file_path"],
             "message": f"Document queued for {style} formatting. Status: DRAFT. Upload your file to begin processing."
         }
@@ -433,7 +439,7 @@ async def upload_document(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Upload endpoint error: {str(e)}")
+        logger.error(f"[v0] Upload endpoint error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 @app.post("/api/documents/process")
@@ -469,7 +475,7 @@ async def process_document(
         return ProcessDocumentResponse(
             success=True,
             job_id=job_id,
-            status="draft",  # FIXED: Use correct status enum
+            status="draft",  # Fixed: Use correct status enum
             message=f"Document queued for {request.style} formatting"
         )
     
