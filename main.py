@@ -138,6 +138,98 @@ app.add_middleware(
 # Security
 security = HTTPBearer(auto_error=False)
 
+# Queue and Worker Integration
+class QueueService:
+    """Service for handling job queue operations"""
+    
+    @staticmethod
+    async def enqueue_job(job_id: str, job_type: str, job_data: Dict[str, Any]):
+        """Add job to processing queue"""
+        try:
+            queue_data = {
+                "job_id": job_id,
+                "job_type": job_type,
+                "job_data": job_data,
+                "status": "queued",
+                "created_at": datetime.utcnow().isoformat(),
+                "attempts": 0
+            }
+            
+            response = supabase.table("job_queue").insert(queue_data).execute()
+            if not response.data:
+                raise Exception("Failed to enqueue job")
+            
+            logger.info(f"Job {job_id} queued for processing")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error enqueueing job: {str(e)}")
+            return False
+
+    @staticmethod
+    async def update_job_status(job_id: str, status: str, progress: int = None, error: str = None):
+        """Update job status in queue"""
+        try:
+            update_data = {
+                "status": status,
+                "updated_at": datetime.utcnow().isoformat()
+            }
+            
+            if progress is not None:
+                update_data["progress"] = progress
+            
+            if error:
+                update_data["error_message"] = error
+                
+            if status in ["completed", "failed"]:
+                update_data["completed_at"] = datetime.utcnow().isoformat()
+            
+            await supabase.table("job_queue").update(update_data).eq("job_id", job_id).execute()
+            
+        except Exception as e:
+            logger.error(f"Error updating job status: {str(e)}")
+
+class FormattingService:
+    """Service for document formatting operations - interfaces with external formatting models"""
+    
+    @staticmethod
+    async def format_document(job_id: str, document_path: str, style: str, options: Dict[str, Any]):
+        """Send document to formatting models service"""
+        try:
+            # This would interface with the actual Formatting Models service
+            formatting_request = {
+                "document_path": document_path,
+                "style": style,
+                "options": options,
+                "callback_url": f"/api/formatting/callback/{job_id}"
+            }
+            
+            # In real implementation, this would call the external formatting service
+            # For now, simulate the process
+            await QueueService.update_job_status(job_id, "processing", 25)
+            await asyncio.sleep(2)
+            
+            await QueueService.update_job_status(job_id, "processing", 75)
+            await asyncio.sleep(2)
+            
+            # Mock successful completion
+            result = {
+                "formatted_document_path": f"formatted/{job_id}/output.docx",
+                "metadata": {
+                    "word_count": 1250,
+                    "changes_made": 47,
+                    "processing_time": 4.2
+                }
+            }
+            
+            await QueueService.update_job_status(job_id, "completed", 100)
+            return result
+            
+        except Exception as e:
+            logger.error(f"Formatting error for job {job_id}: {str(e)}")
+            await QueueService.update_job_status(job_id, "failed", error=str(e))
+            return None
+
 # Service classes
 class AuthService:
     @staticmethod
@@ -285,31 +377,63 @@ class DocumentService:
 
 class ProcessingService:
     @staticmethod
-    async def simulate_processing(job_id: str):
-        """Simulate document processing with realistic delays"""
+    async def start_document_processing(job_id: str, document_path: str, style: str, options: Dict[str, Any]):
+        """Start document processing by enqueueing job"""
         try:
-            await asyncio.sleep(1)
-            await DocumentService.update_document_status(job_id, "processing", 25)
+            # Update document status to queued
+            await DocumentService.update_document_status(job_id, "queued", 0)
             
-            await asyncio.sleep(2)
-            await DocumentService.update_document_status(job_id, "processing", 75)
-            
-            await asyncio.sleep(1)
-            
-            # Mock processing results
-            processing_log = {
-                "progress": 100,
-                "word_count": 1250,
-                "headings_count": 8,
-                "references_count": 15,
-                "processing_time": 3.5
+            # Enqueue job for worker processing
+            job_data = {
+                "document_path": document_path,
+                "style": style,
+                "options": options
             }
             
-            await DocumentService.update_document_status(job_id, "formatted", 100, processing_log)
+            success = await QueueService.enqueue_job(job_id, "document_formatting", job_data)
+            if not success:
+                await DocumentService.update_document_status(job_id, "failed", processing_log={"error": "Failed to enqueue job"})
+                return False
+            
+            # In a real system, a separate worker would pick up this job
+            # For demo purposes, we'll simulate immediate processing
+            asyncio.create_task(ProcessingService._simulate_worker_processing(job_id, document_path, style, options))
+            
+            return True
             
         except Exception as e:
-            logger.error(f"Error in processing simulation: {str(e)}")
+            logger.error(f"Error starting document processing: {str(e)}")
             await DocumentService.update_document_status(job_id, "failed", processing_log={"error": str(e)})
+            return False
+
+    @staticmethod
+    async def _simulate_worker_processing(job_id: str, document_path: str, style: str, options: Dict[str, Any]):
+        """Simulate worker processing (in real system, this would be a separate service)"""
+        try:
+            # Update status to processing
+            await DocumentService.update_document_status(job_id, "processing", 10)
+            await QueueService.update_job_status(job_id, "processing", 10)
+            
+            # Call formatting service
+            result = await FormattingService.format_document(job_id, document_path, style, options)
+            
+            if result:
+                processing_log = {
+                    "progress": 100,
+                    "word_count": result["metadata"]["word_count"],
+                    "changes_made": result["metadata"]["changes_made"],
+                    "processing_time": result["metadata"]["processing_time"],
+                    "formatted_document_path": result["formatted_document_path"]
+                }
+                
+                await DocumentService.update_document_status(job_id, "formatted", 100, processing_log)
+            else:
+                await DocumentService.update_document_status(job_id, "failed", processing_log={"error": "Formatting service failed"})
+                
+        except Exception as e:
+            logger.error(f"Error in worker processing: {str(e)}")
+            await DocumentService.update_document_status(job_id, "failed", processing_log={"error": str(e)})
+            await QueueService.update_job_status(job_id, "failed", error=str(e))
 
 # API Routes
 @app.get("/")
@@ -381,9 +505,20 @@ async def upload_complete_webhook(
         document = await DocumentService.get_document(webhook_data.job_id, user["user_id"])
         
         if webhook_data.success:
-            await DocumentService.update_document_status(webhook_data.job_id, "processing", 0)
-            asyncio.create_task(ProcessingService.simulate_processing(webhook_data.job_id))
-            message = "Upload confirmed. Processing started."
+            await DocumentService.update_document_status(webhook_data.job_id, "uploaded", 5)
+            
+            # Start processing via queue system
+            success = await ProcessingService.start_document_processing(
+                webhook_data.job_id, 
+                webhook_data.file_path, 
+                document["style_applied"], 
+                document["formatting_options"]
+            )
+            
+            if success:
+                message = "Upload confirmed. Document queued for processing."
+            else:
+                message = "Upload confirmed but processing failed to start."
         else:
             await DocumentService.update_document_status(
                 webhook_data.job_id, "failed", 
@@ -424,7 +559,10 @@ async def process_document(
             job_id, request.style, request.englishVariant, options
         )
         
-        asyncio.create_task(ProcessingService.simulate_processing(job_id))
+        # Use queue-based processing for consistency
+        await ProcessingService.start_document_processing(
+            job_id, f"legacy/{job_id}", request.style, options
+        )
         
         return JobResponse(
             success=True,
@@ -539,6 +677,47 @@ async def get_english_variants():
     except Exception as e:
         logger.error(f"Error fetching English variants: {str(e)}")
         return [StyleVariant(**variant) for variant in ENGLISH_VARIANTS]
+
+@app.post("/api/formatting/callback/{job_id}")
+async def formatting_callback(job_id: str, callback_data: dict):
+    """Callback endpoint for formatting service to report completion"""
+    try:
+        if callback_data.get("success"):
+            processing_log = {
+                "progress": 100,
+                "formatted_document_path": callback_data.get("output_path"),
+                "metadata": callback_data.get("metadata", {})
+            }
+            await DocumentService.update_document_status(job_id, "formatted", 100, processing_log)
+        else:
+            error_msg = callback_data.get("error", "Unknown formatting error")
+            await DocumentService.update_document_status(job_id, "failed", processing_log={"error": error_msg})
+        
+        return {"success": True, "message": "Callback processed"}
+        
+    except Exception as e:
+        logger.error(f"Formatting callback error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Callback processing failed")
+
+@app.get("/api/queue/stats")
+async def get_queue_stats():
+    """Get queue statistics for monitoring"""
+    try:
+        response = supabase.table("job_queue").select("status", count="exact").execute()
+        
+        stats = {}
+        for row in response.data:
+            status = row["status"]
+            stats[status] = stats.get(status, 0) + 1
+            
+        return {
+            "queue_stats": stats,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Queue stats error: {str(e)}")
+        return {"queue_stats": {}, "error": str(e)}
 
 # Removed legacy upload endpoint and test endpoints for cleaner production code
 
