@@ -167,21 +167,25 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
 async def generate_signed_upload_url(filename: str, user_id: str) -> Dict[str, str]:
     """Generate signed upload URL for document upload to Supabase Storage and include required headers for frontend"""
     try:
-        # Create unique file path
         file_extension = filename.split('.')[-1].lower() if '.' in filename else 'docx'
-        unique_filename = f"{user_id}/{uuid.uuid4()}.{file_extension}"
-        logger.error(f"Unique filename: {unique_filename}")
-        # Generate signed upload URL
-        response = supabase.storage.from_("documents").create_signed_upload_url(unique_filename)
+        timestamp = int(time.time())
+        unique_filename = f"documents/{user_id}/{timestamp}_{uuid.uuid4()}.{file_extension}"
+        
+        logger.info(f"Generating signed upload URL for file path: {unique_filename}")
+        
+        storage_bucket = "documents"
+        response = supabase.storage.from_(storage_bucket).create_signed_upload_url(unique_filename)
         
         if not response or not response.get("signedURL"):
-            raise Exception("Failed to generate signed upload URL")
+            logger.error(f"Supabase response: {response}")
+            raise Exception("Failed to generate signed upload URL - no signedURL returned")
         
         upload_headers = {
-            "apikey": SUPABASE_ANON_KEY,
             "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-            "Content-Type": "application/octet-stream"
+            "x-upsert": "true"
         }
+        
+        logger.info(f"Successfully generated signed URL for: {unique_filename}")
         
         return {
             "upload_url": response["signedURL"],
@@ -192,9 +196,12 @@ async def generate_signed_upload_url(filename: str, user_id: str) -> Dict[str, s
         
     except Exception as e:
         logger.error(f"Error generating signed upload URL: {str(e)}")
+        logger.error(f"Supabase URL: {SUPABASE_URL}")
+        logger.error(f"Storage bucket: documents")
+        logger.error(f"User ID: {user_id}")
+        logger.error(f"Filename: {filename}")
         raise HTTPException(status_code=500, detail=f"Failed to generate upload URL: {str(e)}")
 
-# Keep the old function for backward compatibility if needed
 async def generate_presigned_upload_url(filename: str, user_id: str) -> Dict[str, str]:
     """Legacy function - redirects to corrected version"""
     return await generate_signed_upload_url(filename, user_id)
@@ -217,7 +224,6 @@ async def create_document_record(user_id: str, filename: str, file_path: str, jo
             "created_at": datetime.utcnow().isoformat(),
             "updated_at": datetime.utcnow().isoformat()
         }
-        
         response = supabase.table("documents").insert(document_data).execute()
         
         if not response.data:
@@ -245,7 +251,6 @@ async def update_document_status(job_id: str, status: str, progress: int = None,
         
         if status == "formatted":
             update_data["processed_at"] = datetime.utcnow().isoformat()
-        
         response = supabase.table("documents").update(update_data).eq("id", job_id).execute()
         
         if not response.data:
@@ -356,8 +361,6 @@ async def upload_complete_webhook(
     """NEW ENDPOINT: Webhook called after frontend successfully uploads file"""
     try:
         job_id = webhook_data.job_id
-        
-        # Verify the job belongs to the user
         response = supabase.table("documents").select("*").eq("id", job_id).eq("user_id", user["user_id"]).execute()
         
         if not response.data:
@@ -424,7 +427,7 @@ async def upload_document(
             upload_info["file_path"], 
             job_id, 
             style, 
-            englishVariant, 
+            englishVariant,
             options
         )
         
