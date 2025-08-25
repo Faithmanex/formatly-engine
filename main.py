@@ -170,7 +170,7 @@ async def generate_signed_upload_url(filename: str, user_id: str) -> Dict[str, s
         # Create unique file path
         file_extension = filename.split('.')[-1].lower() if '.' in filename else 'docx'
         unique_filename = f"{user_id}/{uuid.uuid4()}.{file_extension}"
-        
+        logger.error(f"Unique filename: {unique_filename}")
         # Generate signed upload URL
         response = supabase.storage.from_("documents").create_signed_upload_url(unique_filename)
         
