@@ -174,11 +174,46 @@ async def generate_signed_upload_url(filename: str, user_id: str) -> Dict[str, s
         logger.info(f"Generating signed upload URL for file path: {unique_filename}")
         
         storage_bucket = "documents"
-        response = supabase.storage.from_(storage_bucket).create_signed_upload_url(unique_filename)
-        
-        if not response or not response.get("signedURL"):
-            logger.error(f"Supabase response: {response}")
-            raise Exception("Failed to generate signed upload URL - no signedURL returned")
+        try:
+            # Use the correct Supabase storage method
+            response = supabase.storage.from_(storage_bucket).create_signed_upload_url(unique_filename)
+            logger.info(f"Supabase storage response: {response}")
+            
+            # Handle different response formats from Supabase
+            if isinstance(response, dict):
+                signed_url = response.get("signedURL") or response.get("signed_url") or response.get("url")
+                token = response.get("token", "")
+            else:
+                # If response is a string, it might be the URL directly
+                signed_url = str(response) if response else None
+                token = ""
+            
+            if not signed_url:
+                logger.error(f"No signed URL in response: {response}")
+                raise Exception("Failed to generate signed upload URL - no signedURL returned")
+                
+        except Exception as storage_error:
+            logger.error(f"Supabase storage error: {str(storage_error)}")
+            # Try alternative approach with simpler client
+            try:
+                # Create a simpler client for storage operations
+                storage_client = supabase.storage.from_(storage_bucket)
+                response = storage_client.create_signed_upload_url(unique_filename)
+                logger.info(f"Alternative storage response: {response}")
+                
+                if isinstance(response, dict):
+                    signed_url = response.get("signedURL") or response.get("signed_url") or response.get("url")
+                    token = response.get("token", "")
+                else:
+                    signed_url = str(response) if response else None
+                    token = ""
+                    
+                if not signed_url:
+                    raise Exception("Alternative method also failed to generate signed URL")
+                    
+            except Exception as alt_error:
+                logger.error(f"Alternative storage method failed: {str(alt_error)}")
+                raise Exception(f"Both storage methods failed: {str(storage_error)} | {str(alt_error)}")
         
         upload_headers = {
             "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
@@ -188,9 +223,9 @@ async def generate_signed_upload_url(filename: str, user_id: str) -> Dict[str, s
         logger.info(f"Successfully generated signed URL for: {unique_filename}")
         
         return {
-            "upload_url": response["signedURL"],
+            "upload_url": signed_url,
             "file_path": unique_filename,
-            "upload_token": response.get("token", ""),
+            "upload_token": token,
             "upload_headers": upload_headers
         }
         
