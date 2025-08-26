@@ -1,58 +1,61 @@
-from fastapi import FastAPI, HTTPException, Depends, Form
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 import uuid
 import time
 import base64
+import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 import asyncio
 import jwt
+import httpx
 from supabase import create_client, Client
 import logging
-from contextlib import asynccontextmanager
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Environment variables validation
-class Config:
-    SUPABASE_URL = os.getenv("SUPABASE_URL")
-    SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-    SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")
-    SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
-    PORT = int(os.getenv("PORT", 8000))
-    
-    def validate(self):
-        required_vars = [
-            self.SUPABASE_URL, 
-            self.SUPABASE_SERVICE_ROLE_KEY, 
-            self.SUPABASE_JWT_SECRET, 
-            self.SUPABASE_ANON_KEY
-        ]
-        if not all(required_vars):
-            missing = [var for var, val in zip(
-                ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_JWT_SECRET', 'SUPABASE_ANON_KEY'],
-                required_vars
-            ) if not val]
-            raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
+# Initialize FastAPI app
+app = FastAPI(
+    title="Formatly API",
+    description="Document formatting service API",
+    version="1.0.0"
+)
 
-config = Config()
-config.validate()
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure this properly for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Initialize Supabase client
-supabase: Client = create_client(config.SUPABASE_URL, config.SUPABASE_SERVICE_ROLE_KEY)
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+
+if not all([SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_JWT_SECRET, SUPABASE_ANON_KEY]):
+    raise ValueError("Missing required Supabase environment variables")
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+# Security
+security = HTTPBearer(auto_error=False)
+
+# In-memory storage for demo (use Redis/database in production)
+jobs_storage: Dict[str, Dict[str, Any]] = {}
+files_storage: Dict[str, Dict[str, Any]] = {}
 
 # Pydantic models
 class ProcessDocumentRequest(BaseModel):
     filename: str
-    content: str = Field(..., description="base64 encoded content")
+    content: str  # base64 encoded
     style: str
     englishVariant: str
     reportOnly: bool = False
@@ -60,16 +63,19 @@ class ProcessDocumentRequest(BaseModel):
     preserveFormatting: bool = True
     options: Optional[Dict[str, Any]] = None
 
-class JobResponse(BaseModel):
+class ProcessDocumentResponse(BaseModel):
     success: bool
     job_id: str
+    status: str
     message: str
 
-class CreateUploadResponse(JobResponse):
-    status: str
+class CreateUploadResponse(BaseModel):
+    success: bool
+    job_id: str
     upload_url: str
     upload_token: str
     file_path: str
+    message: str
     upload_headers: Dict[str, str]
 
 class WebhookUploadComplete(BaseModel):
@@ -88,15 +94,20 @@ class DocumentStatusResponse(BaseModel):
 class FormattedDocumentResponse(BaseModel):
     success: bool
     filename: str
-    content: str = Field(..., description="base64 encoded content")
+    content: str  # base64 encoded
     metadata: Dict[str, Any]
 
-class StyleVariant(BaseModel):
+class FormattingStyle(BaseModel):
     id: str
     name: str
     description: str
 
-# Constants
+class EnglishVariant(BaseModel):
+    id: str
+    name: str
+    description: str
+
+# Mock data
 FORMATTING_STYLES = [
     {"id": "apa", "name": "APA Style", "description": "American Psychological Association"},
     {"id": "mla", "name": "MLA Style", "description": "Modern Language Association"},
@@ -111,207 +122,263 @@ ENGLISH_VARIANTS = [
     {"id": "au", "name": "Australian English", "description": "Australian English"},
 ]
 
-# Application lifespan
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("Starting Formatly API")
-    yield
-    logger.info("Shutting down Formatly API")
-
-# Initialize FastAPI app
-app = FastAPI(
-    title="Formatly API",
-    description="Document formatting service API",
-    version="1.0.0",
-    lifespan=lifespan
-)
-
-# CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Configure this properly for production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Security
-security = HTTPBearer(auto_error=False)
-
-# Service classes
-class AuthService:
-    @staticmethod
-    def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-        """Verify JWT token with Supabase"""
-        if not credentials:
-            raise HTTPException(status_code=401, detail="Authorization header required")
+# Helper functions
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Verify JWT token with Supabase"""
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Authorization header required")
+    
+    try:
+        # Decode JWT token
+        token = credentials.credentials
+        payload = jwt.decode(
+            token, 
+            SUPABASE_JWT_SECRET, 
+            algorithms=["HS256"],
+            audience="authenticated"
+        )
         
-        try:
-            payload = jwt.decode(
-                credentials.credentials, 
-                config.SUPABASE_JWT_SECRET, 
-                algorithms=["HS256"],
-                audience="authenticated"
-            )
-            
-            user_id = payload.get("sub")
-            if not user_id:
-                raise HTTPException(status_code=401, detail="Invalid token: missing user ID")
-            
-            # Get user profile
-            profile_response = supabase.table("profiles").select("*").eq("id", user_id).execute()
-            if not profile_response.data:
-                raise HTTPException(status_code=401, detail="User profile not found")
-            
-            return {
-                "user_id": user_id,
-                "email": payload.get("email"),
-                "profile": profile_response.data[0]
-            }
-            
-        except jwt.ExpiredSignatureError:
-            raise HTTPException(status_code=401, detail="Token has expired")
-        except jwt.InvalidTokenError as e:
-            raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
-        except Exception as e:
-            logger.error(f"Token verification error: {str(e)}")
-            raise HTTPException(status_code=401, detail="Token verification failed")
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token: missing user ID")
+        
+        # Get user profile from database
+        profile_response = supabase.table("profiles").select("*").eq("id", user_id).execute()
+        
+        if not profile_response.data:
+            raise HTTPException(status_code=401, detail="User profile not found")
+        
+        profile = profile_response.data[0]
+        
+        return {
+            "user_id": user_id,
+            "email": payload.get("email"),
+            "profile": profile
+        }
+        
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except jwt.InvalidTokenError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
+    except Exception as e:
+        logger.error(f"Token verification error: {str(e)}")
+        raise HTTPException(status_code=401, detail="Token verification failed")
 
-class StorageService:
-    @staticmethod
-    async def generate_signed_upload_url(filename: str, user_id: str) -> Dict[str, str]:
-        """Generate signed upload URL for document upload to Supabase Storage"""
+async def generate_signed_upload_url(filename: str, user_id: str) -> Dict[str, str]:
+    """Generate signed upload URL for document upload to Supabase Storage and include required headers for frontend"""
+    try:
+        file_extension = filename.split('.')[-1].lower() if '.' in filename else 'docx'
+        timestamp = int(time.time())
+        unique_filename = f"documents/{user_id}/{timestamp}_{uuid.uuid4()}.{file_extension}"
+        
+        logger.info(f"Generating signed upload URL for file path: {unique_filename}")
+        
+        storage_bucket = "documents"
         try:
-            file_extension = filename.split('.')[-1].lower() if '.' in filename else 'docx'
-            unique_filename = f"documents/{user_id}/{int(time.time())}_{uuid.uuid4()}.{file_extension}"
+            # Use the correct Supabase storage method
+            response = supabase.storage.from_(storage_bucket).create_signed_upload_url(unique_filename)
+            logger.info(f"Supabase storage response: {response}")
             
-            logger.info(f"Generating signed upload URL for: {unique_filename}")
-            
-            response = supabase.storage.from_("documents").create_signed_upload_url(unique_filename)
-            
-            # Handle response format variations
+            # Handle different response formats from Supabase
             if isinstance(response, dict):
                 signed_url = response.get("signedURL") or response.get("signed_url") or response.get("url")
                 token = response.get("token", "")
             else:
+                # If response is a string, it might be the URL directly
                 signed_url = str(response) if response else None
                 token = ""
             
             if not signed_url:
-                raise Exception("Failed to generate signed upload URL")
+                logger.error(f"No signed URL in response: {response}")
+                raise Exception("Failed to generate signed upload URL - no signedURL returned")
                 
-            return {
-                "upload_url": signed_url,
-                "file_path": unique_filename,
-                "upload_token": token,
-                "upload_headers": {
-                    "Authorization": f"Bearer {config.SUPABASE_ANON_KEY}",
-                    "x-upsert": "true"
-                }
-            }
-            
-        except Exception as e:
-            logger.error(f"Error generating signed upload URL: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Failed to generate upload URL: {str(e)}")
-
-class DocumentService:
-    @staticmethod
-    async def create_document_record(
-        user_id: str, filename: str, file_path: str, job_id: str, 
-        style: str, language_variant: str, options: Dict[str, Any]
-    ) -> str:
-        """Create document record in Supabase database"""
-        try:
-            document_data = {
-                "id": job_id,
-                "user_id": user_id,
-                "filename": filename,
-                "original_filename": filename,
-                "status": "draft",
-                "style_applied": style,
-                "language_variant": language_variant,
-                "storage_location": file_path,
-                "formatting_options": options,
-                "report_only": options.get("reportOnly", False),
-                "file_type": filename.split('.')[-1].lower() if '.' in filename else "docx",
-                "created_at": datetime.utcnow().isoformat(),
-                "updated_at": datetime.utcnow().isoformat()
-            }
-            
-            response = supabase.table("documents").insert(document_data).execute()
-            if not response.data:
-                raise Exception("Failed to create document record")
-            
-            return job_id
-            
-        except Exception as e:
-            logger.error(f"Error creating document record: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Failed to create document record: {str(e)}")
-
-    @staticmethod
-    async def update_document_status(
-        job_id: str, status: str, progress: int = None, processing_log: Dict[str, Any] = None
-    ):
-        """Update document status in database"""
-        try:
-            update_data = {
-                "status": status,
-                "updated_at": datetime.utcnow().isoformat()
-            }
-            
-            if progress is not None:
-                if not processing_log:
-                    processing_log = {}
-                processing_log["progress"] = progress
-                update_data["processing_log"] = processing_log
-            
-            if status == "formatted":
-                update_data["processed_at"] = datetime.utcnow().isoformat()
+        except Exception as storage_error:
+            logger.error(f"Supabase storage error: {str(storage_error)}")
+            # Try alternative approach with simpler client
+            try:
+                # Create a simpler client for storage operations
+                storage_client = supabase.storage.from_(storage_bucket)
+                response = storage_client.create_signed_upload_url(unique_filename)
+                logger.info(f"Alternative storage response: {response}")
                 
-            response = supabase.table("documents").update(update_data).eq("id", job_id).execute()
-            if not response.data:
-                logger.warning(f"No document found with ID: {job_id}")
-            
-        except Exception as e:
-            logger.error(f"Error updating document status: {str(e)}")
+                if isinstance(response, dict):
+                    signed_url = response.get("signedURL") or response.get("signed_url") or response.get("url")
+                    token = response.get("token", "")
+                else:
+                    signed_url = str(response) if response else None
+                    token = ""
+                    
+                if not signed_url:
+                    raise Exception("Alternative method also failed to generate signed URL")
+                    
+            except Exception as alt_error:
+                logger.error(f"Alternative storage method failed: {str(alt_error)}")
+                raise Exception(f"Both storage methods failed: {str(storage_error)} | {str(alt_error)}")
+        
+        upload_headers = {
+            "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+            "x-upsert": "true"
+        }
+        
+        logger.info(f"Successfully generated signed URL for: {unique_filename}")
+        
+        return {
+            "upload_url": signed_url,
+            "file_path": unique_filename,
+            "upload_token": token,
+            "upload_headers": upload_headers
+        }
+        
+    except Exception as e:
+        logger.error(f"Error generating signed upload URL: {str(e)}")
+        logger.error(f"Supabase URL: {SUPABASE_URL}")
+        logger.error(f"Storage bucket: documents")
+        logger.error(f"User ID: {user_id}")
+        logger.error(f"Filename: {filename}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate upload URL: {str(e)}")
 
-    @staticmethod
-    async def get_document(job_id: str, user_id: str):
-        """Get document by job_id and user_id"""
-        response = supabase.table("documents").select("*").eq("id", job_id).eq("user_id", user_id).execute()
+async def generate_presigned_upload_url(filename: str, user_id: str) -> Dict[str, str]:
+    """Legacy function - redirects to corrected version"""
+    return await generate_signed_upload_url(filename, user_id)
+
+async def create_document_record(user_id: str, filename: str, file_path: str, job_id: str, style: str, language_variant: str, options: Dict[str, Any], file_size: Optional[int] = None) -> str:
+    """Create document record in Supabase database"""
+    try:
+        document_data = {
+            "id": job_id,
+            "user_id": user_id,
+            "filename": filename,
+            "original_filename": filename,
+            "status": "draft",
+            "style_applied": style,
+            "language_variant": language_variant,
+            "storage_location": file_path,
+            "formatting_options": options,
+            "report_only": options.get("reportOnly", False),
+            "file_type": filename.split('.')[-1].lower() if '.' in filename else "docx",
+            "created_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat()
+        }
+        
+        if file_size is not None:
+            document_data["file_size"] = file_size
+            logger.info(f"Document record created with file size: {file_size} bytes")
+        
+        response = supabase.table("documents").insert(document_data).execute()
+        
         if not response.data:
-            raise HTTPException(status_code=404, detail="Document not found")
-        return response.data[0]
+            raise Exception("Failed to create document record")
+        
+        return job_id
+        
+    except Exception as e:
+        logger.error(f"Error creating document record: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to create document record: {str(e)}")
 
-class ProcessingService:
-    @staticmethod
-    async def simulate_processing(job_id: str):
-        """Simulate document processing with realistic delays"""
+async def update_document_status(job_id: str, status: str, progress: int = None, processing_log: Dict[str, Any] = None):
+    """Update document status in database"""
+    try:
+        update_data = {
+            "status": status,
+            "updated_at": datetime.utcnow().isoformat()
+        }
+        
+        if progress is not None:
+            if not processing_log:
+                processing_log = {}
+            processing_log["progress"] = progress
+            update_data["processing_log"] = processing_log
+        
+        if status == "formatted":
+            update_data["processed_at"] = datetime.utcnow().isoformat()
+        response = supabase.table("documents").update(update_data).eq("id", job_id).execute()
+        
+        if not response.data:
+            logger.warning(f"No document found with ID: {job_id}")
+        
+    except Exception as e:
+        logger.error(f"Error updating document status: {str(e)}")
+
+async def simulate_processing(job_id: str):
+    """Simulate document processing with database updates"""
+    try:
+        await asyncio.sleep(1)  # Initial delay
+        
+        # Update to processing
+        await update_document_status(job_id, "processing", 25)
+        
+        await asyncio.sleep(2)  # Processing time
+        await update_document_status(job_id, "processing", 75)
+        
+        await asyncio.sleep(1)  # Final processing
+        
+        # Mock processing results
+        processing_log = {
+            "progress": 100,
+            "word_count": 1250,
+            "headings_count": 8,
+            "references_count": 15,
+            "processing_time": 3.5
+        }
+        
+        await update_document_status(job_id, "formatted", 100, processing_log)
+        
         try:
-            await asyncio.sleep(1)
-            await DocumentService.update_document_status(job_id, "processing", 25)
-            
-            await asyncio.sleep(2)
-            await DocumentService.update_document_status(job_id, "processing", 75)
-            
-            await asyncio.sleep(1)
-            
-            # Mock processing results
-            processing_log = {
-                "progress": 100,
-                "word_count": 1250,
-                "headings_count": 8,
-                "references_count": 15,
-                "processing_time": 3.5
-            }
-            
-            await DocumentService.update_document_status(job_id, "formatted", 100, processing_log)
-            
-        except Exception as e:
-            logger.error(f"Error in processing simulation: {str(e)}")
-            await DocumentService.update_document_status(job_id, "failed", processing_log={"error": str(e)})
+            # Get document details to find user_id
+            doc_response = supabase.table("documents").select("user_id, filename").eq("id", job_id).execute()
+            if doc_response.data:
+                user_id = doc_response.data[0]["user_id"]
+                filename = doc_response.data[0]["filename"]
+                
+                # Calculate storage used (mock calculation based on file processing)
+                estimated_storage_mb = processing_log.get("word_count", 1000) * 0.001  # Rough estimate
+                
+                # Call usage tracking functions
+                await track_document_usage(user_id)
+                await track_storage_usage(user_id, estimated_storage_mb)
+                
+                logger.info(f"Usage tracked for user {user_id}: document processed, storage: {estimated_storage_mb}MB")
+            else:
+                logger.warning(f"Could not find document record for job_id: {job_id}")
+                
+        except Exception as usage_error:
+            logger.error(f"Error tracking usage for job {job_id}: {str(usage_error)}")
+            # Don't fail the entire process if usage tracking fails
+        
+    except Exception as e:
+        logger.error(f"Error in processing simulation: {str(e)}")
+        await update_document_status(job_id, "failed", processing_log={"error": str(e)})
+
+async def track_document_usage(user_id: str):
+    """Track document usage in subscriptions table"""
+    try:
+        # Call the database function to increment document usage
+        result = supabase.rpc("increment_document_usage", {"user_uuid": user_id}).execute()
+        logger.info(f"Document usage incremented for user: {user_id}")
+        return result
+    except Exception as e:
+        logger.error(f"Error tracking document usage: {str(e)}")
+        raise
+
+async def track_storage_usage(user_id: str, storage_mb: float):
+    """Track storage usage in subscriptions table"""
+    try:
+        # Convert MB to GB for storage tracking
+        storage_gb = storage_mb / 1024
+        
+        # Call the database function to update storage usage
+        result = supabase.rpc("update_storage_usage", {
+            "user_uuid": user_id, 
+            "storage_gb": storage_gb
+        }).execute()
+        logger.info(f"Storage usage updated for user: {user_id}, added: {storage_gb}GB")
+        return result
+    except Exception as e:
+        logger.error(f"Error tracking storage usage: {str(e)}")
+        raise
 
 # API Routes
+
 @app.get("/")
 async def root():
     return {
@@ -325,7 +392,7 @@ async def root():
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
-@app.post("/api/documents/create-upload", response_model=CreateUploadResponse)
+@app.post("/api/documents/create-upload")
 async def create_upload_url(
     filename: str = Form(...),
     style: str = Form(...),
@@ -333,38 +400,52 @@ async def create_upload_url(
     reportOnly: bool = Form(False),
     includeComments: bool = Form(True),
     preserveFormatting: bool = Form(True),
-    user: dict = Depends(AuthService.verify_token)
-):
-    """Generate signed upload URL and create document record"""
+    file_size: Optional[int] = Form(None),  # Add file_size parameter
+    user: dict = Depends(verify_token)
+) -> CreateUploadResponse:
+    """NEW ENDPOINT: Generate signed upload URL and create document record - PROPER FLOW"""
     try:
         job_id = str(uuid.uuid4())
         
-        # Generate upload URL
-        upload_info = await StorageService.generate_signed_upload_url(filename, user["user_id"])
+        if file_size is not None:
+            if file_size < 0:
+                raise HTTPException(status_code=400, detail="File size must be non-negative")
+            if file_size > 100 * 1024 * 1024:  # 100MB limit
+                raise HTTPException(status_code=400, detail="File size exceeds maximum limit of 100MB")
+            logger.info(f"Creating upload for file: {filename}, size: {file_size} bytes")
         
-        # Create document record
+        # STEP 1: Generate signed upload URL first
+        upload_info = await generate_signed_upload_url(filename, user["user_id"])
+        
+        # STEP 2: Create document record with DRAFT status
         options = {
             "reportOnly": reportOnly,
             "includeComments": includeComments,
             "preserveFormatting": preserveFormatting
         }
         
-        await DocumentService.create_document_record(
-            user["user_id"], filename, upload_info["file_path"], 
-            job_id, style, englishVariant, options
+        await create_document_record(
+            user["user_id"], 
+            filename, 
+            upload_info["file_path"], 
+            job_id, 
+            style, 
+            englishVariant, 
+            options,
+            file_size  # Pass file_size to create_document_record
         )
         
+        # STEP 3: Return job ID and upload URL to frontend
         return CreateUploadResponse(
             success=True,
             job_id=job_id,
-            status="draft",
             upload_url=upload_info["upload_url"],
             upload_token=upload_info["upload_token"],
             file_path=upload_info["file_path"],
             upload_headers=upload_info["upload_headers"],
-            message=f"Upload URL created. Ready for {style} formatting."
+            message=f"Upload URL created. Document status: DRAFT. Please upload your document to begin {style} formatting."
         )
-        
+    
     except HTTPException:
         raise
     except Exception as e:
@@ -374,75 +455,159 @@ async def create_upload_url(
 @app.post("/api/documents/upload-complete")
 async def upload_complete_webhook(
     webhook_data: WebhookUploadComplete,
-    user: dict = Depends(AuthService.verify_token)
+    user: dict = Depends(verify_token)
 ):
-    """Webhook called after successful file upload"""
+    """NEW ENDPOINT: Webhook called after frontend successfully uploads file"""
     try:
-        document = await DocumentService.get_document(webhook_data.job_id, user["user_id"])
+        job_id = webhook_data.job_id
+        response = supabase.table("documents").select("*").eq("id", job_id).eq("user_id", user["user_id"]).execute()
+        
+        if not response.data:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        document = response.data[0]
         
         if webhook_data.success:
-            await DocumentService.update_document_status(webhook_data.job_id, "processing", 0)
-            asyncio.create_task(ProcessingService.simulate_processing(webhook_data.job_id))
-            message = "Upload confirmed. Processing started."
+            # Update status to processing and start processing
+            await update_document_status(job_id, "processing", 0)
+            
+            # Start background processing
+            asyncio.create_task(simulate_processing(job_id))
+            
+            return {
+                "success": True,
+                "message": "Upload confirmed. Document processing started. Status: PROCESSING",
+                "job_id": job_id
+            }
         else:
-            await DocumentService.update_document_status(
-                webhook_data.job_id, "failed", 
-                processing_log={"error": "File upload failed"}
-            )
-            message = "Upload failed. Please try again."
-        
-        return {
-            "success": webhook_data.success,
-            "message": message,
-            "job_id": webhook_data.job_id
-        }
-        
+            # Upload failed
+            await update_document_status(job_id, "failed", processing_log={"error": "File upload failed"})
+            
+            return {
+                "success": False,
+                "message": "Upload failed. Status: FAILED. Please try again.",
+                "job_id": job_id
+            }
+    
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Upload complete webhook error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Webhook processing failed: {str(e)}")
 
-@app.post("/api/documents/process", response_model=JobResponse)
-async def process_document(
-    request: ProcessDocumentRequest,
-    user: dict = Depends(AuthService.verify_token)
+@app.post("/api/documents/upload")
+async def upload_document(
+    filename: str = Form(...),
+    style: str = Form(...),
+    englishVariant: str = Form(...),
+    reportOnly: bool = Form(False),
+    includeComments: bool = Form(True),
+    preserveFormatting: bool = Form(True),
+    file_size: Optional[int] = Form(None),  # Add file_size parameter for backward compatibility
+    user: dict = Depends(verify_token)
 ):
-    """Process document with formatting (legacy endpoint)"""
+    """EXISTING ENDPOINT: Generate presigned upload URL and create document record - KEPT FOR COMPATIBILITY"""
     try:
         job_id = str(uuid.uuid4())
         
+        if file_size is not None:
+            if file_size < 0:
+                raise HTTPException(status_code=400, detail="File size must be non-negative")
+            if file_size > 100 * 1024 * 1024:  # 100MB limit
+                raise HTTPException(status_code=400, detail="File size exceeds maximum limit of 100MB")
+            logger.info(f"Legacy upload for file: {filename}, size: {file_size} bytes")
+        
+        # FIXED: Use corrected upload URL generation
+        upload_info = await generate_signed_upload_url(filename, user["user_id"])
+        
+        # Prepare formatting options
+        options = {
+            "reportOnly": reportOnly,
+            "includeComments": includeComments,
+            "preserveFormatting": preserveFormatting
+        }
+        
+        # Create document record in database
+        await create_document_record(
+            user["user_id"], 
+            filename, 
+            upload_info["file_path"], 
+            job_id, 
+            style, 
+            englishVariant,
+            options,
+            file_size  # Pass file_size to create_document_record
+        )
+        
+        return {
+            "success": True,
+            "job_id": job_id,
+            "upload_url": upload_info["upload_url"],
+            "upload_token": upload_info.get("upload_token", ""),
+            "file_path": upload_info["file_path"],
+            "upload_headers": upload_info["upload_headers"],
+            "message": f"Document queued for {style} formatting. Status: DRAFT. Upload your file to begin processing."
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Upload endpoint error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+@app.post("/api/documents/process")
+async def process_document(
+    request: ProcessDocumentRequest,
+    user: dict = Depends(verify_token)
+):
+    """Process a document with formatting (legacy endpoint for backward compatibility)"""
+    try:
+        job_id = str(uuid.uuid4())
+        
+        # For backward compatibility, create a document record with base64 content
         options = {
             "reportOnly": request.reportOnly,
             "includeComments": request.includeComments,
             "preserveFormatting": request.preserveFormatting,
-            "content": request.content
+            "content": request.content  # Store base64 content temporarily
         }
         
-        await DocumentService.create_document_record(
-            user["user_id"], request.filename, f"legacy/{job_id}",
-            job_id, request.style, request.englishVariant, options
+        await create_document_record(
+            user["user_id"],
+            request.filename,
+            f"legacy/{job_id}",  # Legacy storage path
+            job_id,
+            request.style,
+            request.englishVariant,
+            options
         )
         
-        asyncio.create_task(ProcessingService.simulate_processing(job_id))
+        # Start background processing immediately for legacy endpoint
+        asyncio.create_task(simulate_processing(job_id))
         
-        return JobResponse(
+        return ProcessDocumentResponse(
             success=True,
             job_id=job_id,
+            status="draft",
             message=f"Document queued for {request.style} formatting"
         )
-        
+    
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Process endpoint error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
 
-@app.get("/api/documents/status/{job_id}", response_model=DocumentStatusResponse)
-async def get_document_status(job_id: str, user: dict = Depends(AuthService.verify_token)):
-    """Get document processing status"""
+@app.get("/api/documents/status/{job_id}")
+async def get_document_status(job_id: str, user: dict = Depends(verify_token)):
+    """Get the status of a document processing job from database"""
     try:
-        document = await DocumentService.get_document(job_id, user["user_id"])
+        response = supabase.table("documents").select("*").eq("id", job_id).eq("user_id", user["user_id"]).execute()
+        
+        if not response.data:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        document = response.data[0]
         processing_log = document.get("processing_log") or {}
         
         return DocumentStatusResponse(
@@ -460,15 +625,21 @@ async def get_document_status(job_id: str, user: dict = Depends(AuthService.veri
         logger.error(f"Status endpoint error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to get status: {str(e)}")
 
-@app.get("/api/documents/download/{job_id}", response_model=FormattedDocumentResponse)
-async def download_document(job_id: str, user: dict = Depends(AuthService.verify_token)):
-    """Download formatted document"""
+@app.get("/api/documents/download/{job_id}")
+async def download_document(job_id: str, user: dict = Depends(verify_token)):
+    """Download a formatted document"""
     try:
-        document = await DocumentService.get_document(job_id, user["user_id"])
+        response = supabase.table("documents").select("*").eq("id", job_id).eq("user_id", user["user_id"]).execute()
+        
+        if not response.data:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        document = response.data[0]
         
         if document["status"] != "formatted":
             raise HTTPException(status_code=400, detail="Document not ready for download")
         
+        # For now, return mock formatted content since actual formatting is not implemented
         processing_log = document.get("processing_log") or {}
         
         # Mock formatted content
@@ -496,52 +667,79 @@ async def download_document(job_id: str, user: dict = Depends(AuthService.verify
         logger.error(f"Download endpoint error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
 
-@app.get("/api/formatting/styles", response_model=List[StyleVariant])
+@app.get("/api/formatting/styles")
 async def get_formatting_styles():
-    """Get available formatting styles"""
+    """Get available formatting styles from database"""
     try:
         response = supabase.table("active_formatting_styles").select("*").order("sort_order").execute()
         
         if response.data:
             return [
-                StyleVariant(
-                    id=style["code"],
-                    name=style["name"],
-                    description=style["description"]
-                )
+                {
+                    "id": style["code"],
+                    "name": style["name"],
+                    "description": style["description"]
+                }
                 for style in response.data
             ]
         else:
-            return [StyleVariant(**style) for style in FORMATTING_STYLES]
+            # Fallback to mock data if database is empty
+            return FORMATTING_STYLES
             
     except Exception as e:
         logger.error(f"Error fetching formatting styles: {str(e)}")
-        return [StyleVariant(**style) for style in FORMATTING_STYLES]
+        return FORMATTING_STYLES
 
-@app.get("/api/formatting/variants", response_model=List[StyleVariant])
+@app.get("/api/formatting/variants")
 async def get_english_variants():
-    """Get available English variants"""
+    """Get available English variants from database"""
     try:
         response = supabase.table("active_english_variants").select("*").order("sort_order").execute()
         
         if response.data:
             return [
-                StyleVariant(
-                    id=variant["code"],
-                    name=variant["name"],
-                    description=variant["description"]
-                )
+                {
+                    "id": variant["code"],
+                    "name": variant["name"],
+                    "description": variant["description"]
+                }
                 for variant in response.data
             ]
         else:
-            return [StyleVariant(**variant) for variant in ENGLISH_VARIANTS]
+            # Fallback to mock data if database is empty
+            return ENGLISH_VARIANTS
             
     except Exception as e:
         logger.error(f"Error fetching English variants: {str(e)}")
-        return [StyleVariant(**variant) for variant in ENGLISH_VARIANTS]
+        return ENGLISH_VARIANTS
 
-# Removed legacy upload endpoint and test endpoints for cleaner production code
+# Additional utility endpoints for testing
+
+@app.get("/api/jobs")
+async def list_jobs():
+    """List all jobs (for testing)"""
+    return {
+        "jobs": list(jobs_storage.values()),
+        "total": len(jobs_storage)
+    }
+
+@app.delete("/api/jobs/{job_id}")
+async def delete_job(job_id: str):
+    """Delete a job (for testing)"""
+    if job_id in jobs_storage:
+        del jobs_storage[job_id]
+        return {"success": True, "message": "Job deleted"}
+    raise HTTPException(status_code=404, detail="Job not found")
+
+@app.get("/api/files")
+async def list_files():
+    """List all uploaded files (for testing)"""
+    return {
+        "files": list(files_storage.values()),
+        "total": len(files_storage)
+    }
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=config.PORT)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
