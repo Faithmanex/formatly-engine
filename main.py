@@ -353,7 +353,7 @@ async def track_document_usage(user_id: str):
     """Track document usage in subscriptions table"""
     try:
         # Call the database function to increment document usage
-        result = supabase.rpc("increment_document_usage", {"user_uuid": user_id}).execute()
+        result = supabase.rpc("increment_document_usage", {"p_user_id": user_id}).execute()
         logger.info(f"Document usage incremented for user: {user_id}")
         return result
     except Exception as e:
@@ -368,7 +368,7 @@ async def track_storage_usage(user_id: str, storage_mb: float):
         
         # Call the database function to update storage usage
         result = supabase.rpc("update_storage_usage", {
-            "user_uuid": user_id, 
+            "p_user_id": user_id, 
             "storage_gb": storage_gb
         }).execute()
         logger.info(f"Storage usage updated for user: {user_id}, added: {storage_gb}GB")
