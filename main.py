@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
 import uuid
 import time
@@ -39,6 +39,8 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+STORAGE_BUCKET = os.getenv("STORAGE_BUCKET", "documents")  # make bucket configurable
+REQUEST_TIMEOUT = 30  # add timeout constant
 
 if not all([SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_JWT_SECRET, SUPABASE_ANON_KEY]):
     raise ValueError("Missing required Supabase environment variables")
@@ -79,9 +81,10 @@ class CreateUploadResponse(BaseModel):
     upload_headers: Dict[str, str]
 
 class WebhookUploadComplete(BaseModel):
-    job_id: str
-    file_path: str
-    success: bool
+    job_id: str = Field(..., min_length=1, description="Job ID from document creation")
+    file_path: str = Field(..., min_length=1, description="Storage file path")
+    success: bool = Field(default=True, description="Whether upload succeeded")
+    error: Optional[str] = Field(default=None, description="Error message if upload failed")
 
 class DocumentStatusResponse(BaseModel):
     success: bool
@@ -165,81 +168,52 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
         raise HTTPException(status_code=401, detail="Token verification failed")
 
 async def generate_signed_upload_url(filename: str, user_id: str) -> Dict[str, str]:
-    """Generate signed upload URL for document upload to Supabase Storage and include required headers for frontend"""
+    """Generate signed upload URL for document upload to Supabase Storage"""
     try:
+        if not filename:
+            raise ValueError("Filename cannot be empty")
+        
         file_extension = filename.split('.')[-1].lower() if '.' in filename else 'docx'
         timestamp = int(time.time())
         unique_filename = f"documents/{user_id}/{timestamp}_{uuid.uuid4()}.{file_extension}"
         
-        logger.info(f"Generating signed upload URL for file path: {unique_filename}")
+        logger.info(f"Generating signed upload URL for: {unique_filename}")
         
-        storage_bucket = "documents"
         try:
-            # Use the correct Supabase storage method
-            response = supabase.storage.from_(storage_bucket).create_signed_upload_url(unique_filename)
-            logger.info(f"Supabase storage response: {response}")
+            response = supabase.storage.from_(STORAGE_BUCKET).create_signed_upload_url(unique_filename)
+            logger.info(f"[v0] Supabase storage response type: {type(response)}, content: {response}")
             
-            # Handle different response formats from Supabase
-            if isinstance(response, dict):
-                signed_url = response.get("signedURL") or response.get("signed_url") or response.get("url")
-                token = response.get("token", "")
-            else:
-                # If response is a string, it might be the URL directly
-                signed_url = str(response) if response else None
-                token = ""
+            # Handle the response - Supabase returns a dict with 'signedURL' key
+            if not isinstance(response, dict):
+                raise ValueError(f"Unexpected response type from Supabase: {type(response)}")
             
+            signed_url = response.get("signedURL")
             if not signed_url:
-                logger.error(f"No signed URL in response: {response}")
-                raise Exception("Failed to generate signed upload URL - no signedURL returned")
-                
-        except Exception as storage_error:
-            logger.error(f"Supabase storage error: {str(storage_error)}")
-            # Try alternative approach with simpler client
-            try:
-                # Create a simpler client for storage operations
-                storage_client = supabase.storage.from_(storage_bucket)
-                response = storage_client.create_signed_upload_url(unique_filename)
-                logger.info(f"Alternative storage response: {response}")
-                
-                if isinstance(response, dict):
-                    signed_url = response.get("signedURL") or response.get("signed_url") or response.get("url")
-                    token = response.get("token", "")
-                else:
-                    signed_url = str(response) if response else None
-                    token = ""
-                    
-                if not signed_url:
-                    raise Exception("Alternative method also failed to generate signed URL")
-                    
-            except Exception as alt_error:
-                logger.error(f"Alternative storage method failed: {str(alt_error)}")
-                raise Exception(f"Both storage methods failed: {str(storage_error)} | {str(alt_error)}")
-        
-        upload_headers = {
-            "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-            "x-upsert": "true"
-        }
-        
-        logger.info(f"Successfully generated signed URL for: {unique_filename}")
-        
-        return {
-            "upload_url": signed_url,
-            "file_path": unique_filename,
-            "upload_token": token,
-            "upload_headers": upload_headers
-        }
+                raise ValueError(f"No signedURL in response. Keys available: {list(response.keys())}")
+            
+            upload_headers = {
+                "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+                "x-upsert": "true"
+            }
+            
+            logger.info(f"Successfully generated signed URL for: {unique_filename}")
+            
+            return {
+                "upload_url": signed_url,
+                "file_path": unique_filename,
+                "upload_token": response.get("token", ""),
+                "upload_headers": upload_headers
+            }
+            
+        except Exception as e:
+            logger.error(f"Supabase storage error: {str(e)}")
+            logger.error(f"Debug info - Storage bucket: {STORAGE_BUCKET}, File path: {unique_filename}")
+            logger.error(f"Debug info - Supabase URL present: {bool(SUPABASE_URL)}, Service role key present: {bool(SUPABASE_SERVICE_ROLE_KEY)}")
+            raise
         
     except Exception as e:
         logger.error(f"Error generating signed upload URL: {str(e)}")
-        logger.error(f"Supabase URL: {SUPABASE_URL}")
-        logger.error(f"Storage bucket: documents")
-        logger.error(f"User ID: {user_id}")
-        logger.error(f"Filename: {filename}")
         raise HTTPException(status_code=500, detail=f"Failed to generate upload URL: {str(e)}")
-
-async def generate_presigned_upload_url(filename: str, user_id: str) -> Dict[str, str]:
-    """Legacy function - redirects to corrected version"""
-    return await generate_signed_upload_url(filename, user_id)
 
 async def create_document_record(user_id: str, filename: str, file_path: str, job_id: str, style: str, language_variant: str, options: Dict[str, Any], file_size: Optional[int] = None) -> str:
     """Create document record in Supabase database"""
@@ -269,6 +243,7 @@ async def create_document_record(user_id: str, filename: str, file_path: str, jo
         if not response.data:
             raise Exception("Failed to create document record")
         
+        logger.info(f"Document record created: {job_id}")
         return job_id
         
     except Exception as e:
@@ -291,10 +266,13 @@ async def update_document_status(job_id: str, status: str, progress: int = None,
         
         if status == "formatted":
             update_data["processed_at"] = datetime.utcnow().isoformat()
+        
         response = supabase.table("documents").update(update_data).eq("id", job_id).execute()
         
         if not response.data:
             logger.warning(f"No document found with ID: {job_id}")
+        
+        logger.info(f"Document {job_id} status updated to: {status}")
         
     except Exception as e:
         logger.error(f"Error updating document status: {str(e)}")
@@ -400,7 +378,7 @@ async def create_upload_url(
     reportOnly: bool = Form(False),
     includeComments: bool = Form(True),
     preserveFormatting: bool = Form(True),
-    file_size: Optional[int] = Form(None),  # Add file_size parameter
+    file_size: Optional[int] = Form(None),
     user: dict = Depends(verify_token)
 ) -> CreateUploadResponse:
     """NEW ENDPOINT: Generate signed upload URL and create document record - PROPER FLOW"""
@@ -432,7 +410,7 @@ async def create_upload_url(
             style, 
             englishVariant, 
             options,
-            file_size  # Pass file_size to create_document_record
+            file_size
         )
         
         # STEP 3: Return job ID and upload URL to frontend
@@ -460,19 +438,30 @@ async def upload_complete_webhook(
     """NEW ENDPOINT: Webhook called after frontend successfully uploads file"""
     try:
         job_id = webhook_data.job_id
+        logger.info(f"Processing upload complete for job: {job_id}, success: {webhook_data.success}")
+        
+        # Verify document belongs to user
         response = supabase.table("documents").select("*").eq("id", job_id).eq("user_id", user["user_id"]).execute()
         
         if not response.data:
-            raise HTTPException(status_code=404, detail="Job not found")
+            logger.error(f"Job not found or unauthorized: {job_id}")
+            raise HTTPException(status_code=404, detail="Job not found or unauthorized")
         
         document = response.data[0]
+        logger.info(f"Document found: {document['filename']}, current status: {document['status']}")
         
         if webhook_data.success:
+            # Validate file_path matches stored path
+            if document["storage_location"] != webhook_data.file_path:
+                logger.warning(f"File path mismatch. Expected: {document['storage_location']}, Got: {webhook_data.file_path}")
+            
             # Update status to processing and start processing
             await update_document_status(job_id, "processing", 0)
             
             # Start background processing
             asyncio.create_task(simulate_processing(job_id))
+            
+            logger.info(f"Upload confirmed for job {job_id}. Processing started.")
             
             return {
                 "success": True,
@@ -481,18 +470,21 @@ async def upload_complete_webhook(
             }
         else:
             # Upload failed
-            await update_document_status(job_id, "failed", processing_log={"error": "File upload failed"})
+            error_msg = webhook_data.error or "File upload failed"
+            await update_document_status(job_id, "failed", processing_log={"error": error_msg})
+            
+            logger.error(f"Upload failed for job {job_id}: {error_msg}")
             
             return {
                 "success": False,
-                "message": "Upload failed. Status: FAILED. Please try again.",
+                "message": f"Upload failed: {error_msg}. Status: FAILED. Please try again.",
                 "job_id": job_id
             }
     
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Upload complete webhook error: {str(e)}")
+        logger.error(f"Upload complete webhook error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Webhook processing failed: {str(e)}")
 
 @app.post("/api/documents/upload")
@@ -503,7 +495,7 @@ async def upload_document(
     reportOnly: bool = Form(False),
     includeComments: bool = Form(True),
     preserveFormatting: bool = Form(True),
-    file_size: Optional[int] = Form(None),  # Add file_size parameter for backward compatibility
+    file_size: Optional[int] = Form(None),
     user: dict = Depends(verify_token)
 ):
     """EXISTING ENDPOINT: Generate presigned upload URL and create document record - KEPT FOR COMPATIBILITY"""
@@ -517,7 +509,7 @@ async def upload_document(
                 raise HTTPException(status_code=400, detail="File size exceeds maximum limit of 100MB")
             logger.info(f"Legacy upload for file: {filename}, size: {file_size} bytes")
         
-        # FIXED: Use corrected upload URL generation
+        # Generate upload URL
         upload_info = await generate_signed_upload_url(filename, user["user_id"])
         
         # Prepare formatting options
@@ -536,7 +528,7 @@ async def upload_document(
             style, 
             englishVariant,
             options,
-            file_size  # Pass file_size to create_document_record
+            file_size
         )
         
         return {
