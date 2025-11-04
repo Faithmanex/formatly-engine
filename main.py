@@ -369,7 +369,7 @@ async def track_storage_usage(user_id: str, storage_mb: float):
         # Call the database function to update storage usage
         result = supabase.rpc("update_storage_usage", {
             "p_user_id": user_id, 
-            "storage_gb": storage_gb
+            "p_storage_gb": storage_gb
         }).execute()
         logger.info(f"Storage usage updated for user: {user_id}, added: {storage_gb}GB")
         return result
