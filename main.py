@@ -94,7 +94,8 @@ class DocumentStatusResponse(BaseModel):
 class FormattedDocumentResponse(BaseModel):
     success: bool
     filename: str
-    content: str  # base64 encoded
+    content: str  # base64 encoded - neat copy
+    tracked_changes_content: Optional[str] = None  # base64 encoded - version with tracked changes
     metadata: Dict[str, Any]
 
 class FormattingStyle(BaseModel):
@@ -641,23 +642,33 @@ async def download_document(job_id: str, user: dict = Depends(verify_token)):
         
         # For now, return mock formatted content since actual formatting is not implemented
         processing_log = document.get("processing_log") or {}
+        formatting_options = document.get("formatting_options") or {}
         
         # Mock formatted content
         mock_content = f"FORMATTED DOCUMENT: {document['filename']}\nStyle: {document['style_applied']}\nVariant: {document['language_variant']}"
         formatted_content = base64.b64encode(mock_content.encode()).decode()
+        
+        tracked_changes_content = None
+        if formatting_options.get("trackedChanges"):
+            tracked_content = f"TRACKED CHANGES VERSION: {document['filename']}\nStyle: {document['style_applied']}\nVariant: {document['language_variant']}\n\n[CHANGES TRACKED:]\n- Paragraph formatting adjusted\n- Heading styles applied\n- Spacing normalized\n- References formatted"
+            tracked_changes_content = base64.b64encode(tracked_content.encode()).decode()
         
         metadata = {
             "word_count": processing_log.get("word_count", 1250),
             "headings_count": processing_log.get("headings_count", 8),
             "references_count": processing_log.get("references_count", 15),
             "style_applied": document["style_applied"],
-            "processing_time": processing_log.get("processing_time", 3.5)
+            "processing_time": processing_log.get("processing_time", 3.5),
+            "tracked_changes_enabled": formatting_options.get("trackedChanges", False),
+            "complete_editing": formatting_options.get("completeEditing", False),
+            "report_only": formatting_options.get("reportOnly", False)
         }
         
         return FormattedDocumentResponse(
             success=True,
             filename=f"formatted_{document['filename']}",
             content=formatted_content,
+            tracked_changes_content=tracked_changes_content,
             metadata=metadata
         )
         
