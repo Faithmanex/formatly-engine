@@ -58,7 +58,7 @@ class ProcessDocumentRequest(BaseModel):
     content: str  # base64 encoded
     style: str
     englishVariant: str
-    trackedChanges: bool = True
+    trackedChanges: bool = False
     options: Optional[Dict[str, Any]] = None
 
 class ProcessDocumentResponse(BaseModel):
@@ -253,12 +253,17 @@ async def create_document_record(user_id: str, filename: str, file_path: str, jo
             "language_variant": language_variant,
             "storage_location": file_path,
             "formatting_options": options,
+            "tracked_changes": options.get("trackedChanges", False),
             "file_type": filename.split('.')[-1].lower() if '.' in filename else "docx",
             "created_at": datetime.utcnow().isoformat(),
             "updated_at": datetime.utcnow().isoformat()
         }
         
         if file_size is not None:
+            if file_size < 0:
+                raise HTTPException(status_code=400, detail="File size must be non-negative")
+            if file_size > 100 * 1024 * 1024:  # 100MB limit
+                raise HTTPException(status_code=400, detail="File size exceeds maximum limit of 100MB")
             document_data["file_size"] = file_size
             logger.info(f"Document record created with file size: {file_size} bytes")
         
@@ -314,8 +319,6 @@ async def simulate_processing(job_id: str):
         processing_log = {
             "progress": 100,
             "word_count": 1250,
-            "headings_count": 8,
-            "references_count": 15,
             "processing_time": 3.5
         }
         
@@ -395,7 +398,7 @@ async def create_upload_url(
     filename: str = Form(...),
     style: str = Form(...),
     englishVariant: str = Form(...),
-    trackedChanges: bool = Form(True),
+    trackedChanges: bool = Form(False),
     file_size: Optional[int] = Form(None),
     user: dict = Depends(verify_token)
 ) -> CreateUploadResponse:
@@ -494,7 +497,7 @@ async def upload_document(
     filename: str = Form(...),
     style: str = Form(...),
     englishVariant: str = Form(...),
-    trackedChanges: bool = Form(True),
+    trackedChanges: bool = Form(False),
     file_size: Optional[int] = Form(None),
     user: dict = Depends(verify_token)
 ):
@@ -629,17 +632,18 @@ async def download_document(job_id: str, user: dict = Depends(verify_token)):
         formatted_content = base64.b64encode(mock_content.encode()).decode()
         
         tracked_changes_content = None
-        if formatting_options.get("trackedChanges", True):
+        # Check both the column and the options for backward compatibility
+        tracked_changes_enabled = document.get("tracked_changes") or formatting_options.get("trackedChanges", False)
+        
+        if tracked_changes_enabled:
             tracked_content = f"TRACKED CHANGES VERSION: {document['filename']}\nStyle: {document['style_applied']}\nVariant: {document['language_variant']}\n\n[CHANGES TRACKED:]\n- Paragraph formatting adjusted\n- Heading styles applied\n- Spacing normalized\n- References formatted"
             tracked_changes_content = base64.b64encode(tracked_content.encode()).decode()
         
         metadata = {
             "word_count": processing_log.get("word_count", 1250),
-            "headings_count": processing_log.get("headings_count", 8),
-            "references_count": processing_log.get("references_count", 15),
             "style_applied": document["style_applied"],
             "processing_time": processing_log.get("processing_time", 3.5),
-            "tracked_changes_enabled": formatting_options.get("trackedChanges", True)
+            "tracked_changes_enabled": tracked_changes_enabled
         }
         
         return FormattedDocumentResponse(
