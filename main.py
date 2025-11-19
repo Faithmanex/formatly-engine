@@ -58,9 +58,7 @@ class ProcessDocumentRequest(BaseModel):
     content: str  # base64 encoded
     style: str
     englishVariant: str
-    reportOnly: bool = False
-    includeComments: bool = True
-    preserveFormatting: bool = True
+    trackedChanges: bool = True
     options: Optional[Dict[str, Any]] = None
 
 class ProcessDocumentResponse(BaseModel):
@@ -255,7 +253,6 @@ async def create_document_record(user_id: str, filename: str, file_path: str, jo
             "language_variant": language_variant,
             "storage_location": file_path,
             "formatting_options": options,
-            "report_only": options.get("reportOnly", False),
             "file_type": filename.split('.')[-1].lower() if '.' in filename else "docx",
             "created_at": datetime.utcnow().isoformat(),
             "updated_at": datetime.utcnow().isoformat()
@@ -398,10 +395,8 @@ async def create_upload_url(
     filename: str = Form(...),
     style: str = Form(...),
     englishVariant: str = Form(...),
-    reportOnly: bool = Form(False),
-    includeComments: bool = Form(True),
-    preserveFormatting: bool = Form(True),
-    file_size: Optional[int] = Form(None),  # Add file_size parameter
+    trackedChanges: bool = Form(True),
+    file_size: Optional[int] = Form(None),
     user: dict = Depends(verify_token)
 ) -> CreateUploadResponse:
     """NEW ENDPOINT: Generate signed upload URL and create document record - PROPER FLOW"""
@@ -420,9 +415,7 @@ async def create_upload_url(
         
         # STEP 2: Create document record with DRAFT status
         options = {
-            "reportOnly": reportOnly,
-            "includeComments": includeComments,
-            "preserveFormatting": preserveFormatting
+            "trackedChanges": trackedChanges
         }
         
         await create_document_record(
@@ -433,7 +426,7 @@ async def create_upload_url(
             style, 
             englishVariant, 
             options,
-            file_size  # Pass file_size to create_document_record
+            file_size
         )
         
         # STEP 3: Return job ID and upload URL to frontend
@@ -501,10 +494,8 @@ async def upload_document(
     filename: str = Form(...),
     style: str = Form(...),
     englishVariant: str = Form(...),
-    reportOnly: bool = Form(False),
-    includeComments: bool = Form(True),
-    preserveFormatting: bool = Form(True),
-    file_size: Optional[int] = Form(None),  # Add file_size parameter for backward compatibility
+    trackedChanges: bool = Form(True),
+    file_size: Optional[int] = Form(None),
     user: dict = Depends(verify_token)
 ):
     """EXISTING ENDPOINT: Generate presigned upload URL and create document record - KEPT FOR COMPATIBILITY"""
@@ -521,11 +512,8 @@ async def upload_document(
         # FIXED: Use corrected upload URL generation
         upload_info = await generate_signed_upload_url(filename, user["user_id"])
         
-        # Prepare formatting options
         options = {
-            "reportOnly": reportOnly,
-            "includeComments": includeComments,
-            "preserveFormatting": preserveFormatting
+            "trackedChanges": trackedChanges
         }
         
         # Create document record in database
@@ -537,7 +525,7 @@ async def upload_document(
             style, 
             englishVariant,
             options,
-            file_size  # Pass file_size to create_document_record
+            file_size
         )
         
         return {
@@ -565,11 +553,8 @@ async def process_document(
     try:
         job_id = str(uuid.uuid4())
         
-        # For backward compatibility, create a document record with base64 content
         options = {
-            "reportOnly": request.reportOnly,
-            "includeComments": request.includeComments,
-            "preserveFormatting": request.preserveFormatting,
+            "trackedChanges": request.trackedChanges,
             "content": request.content  # Store base64 content temporarily
         }
         
@@ -583,7 +568,6 @@ async def process_document(
             options
         )
         
-        # Start background processing immediately for legacy endpoint
         asyncio.create_task(simulate_processing(job_id))
         
         return ProcessDocumentResponse(
@@ -601,7 +585,6 @@ async def process_document(
 
 @app.get("/api/documents/status/{job_id}")
 async def get_document_status(job_id: str, user: dict = Depends(verify_token)):
-    """Get the status of a document processing job from database"""
     try:
         response = supabase.table("documents").select("*").eq("id", job_id).eq("user_id", user["user_id"]).execute()
         
@@ -628,7 +611,6 @@ async def get_document_status(job_id: str, user: dict = Depends(verify_token)):
 
 @app.get("/api/documents/download/{job_id}")
 async def download_document(job_id: str, user: dict = Depends(verify_token)):
-    """Download a formatted document"""
     try:
         response = supabase.table("documents").select("*").eq("id", job_id).eq("user_id", user["user_id"]).execute()
         
@@ -640,16 +622,14 @@ async def download_document(job_id: str, user: dict = Depends(verify_token)):
         if document["status"] != "formatted":
             raise HTTPException(status_code=400, detail="Document not ready for download")
         
-        # For now, return mock formatted content since actual formatting is not implemented
         processing_log = document.get("processing_log") or {}
         formatting_options = document.get("formatting_options") or {}
         
-        # Mock formatted content
         mock_content = f"FORMATTED DOCUMENT: {document['filename']}\nStyle: {document['style_applied']}\nVariant: {document['language_variant']}"
         formatted_content = base64.b64encode(mock_content.encode()).decode()
         
         tracked_changes_content = None
-        if formatting_options.get("trackedChanges"):
+        if formatting_options.get("trackedChanges", True):
             tracked_content = f"TRACKED CHANGES VERSION: {document['filename']}\nStyle: {document['style_applied']}\nVariant: {document['language_variant']}\n\n[CHANGES TRACKED:]\n- Paragraph formatting adjusted\n- Heading styles applied\n- Spacing normalized\n- References formatted"
             tracked_changes_content = base64.b64encode(tracked_content.encode()).decode()
         
@@ -659,9 +639,7 @@ async def download_document(job_id: str, user: dict = Depends(verify_token)):
             "references_count": processing_log.get("references_count", 15),
             "style_applied": document["style_applied"],
             "processing_time": processing_log.get("processing_time", 3.5),
-            "tracked_changes_enabled": formatting_options.get("trackedChanges", False),
-            "complete_editing": formatting_options.get("completeEditing", False),
-            "report_only": formatting_options.get("reportOnly", False)
+            "tracked_changes_enabled": formatting_options.get("trackedChanges", True)
         }
         
         return FormattedDocumentResponse(
@@ -680,7 +658,6 @@ async def download_document(job_id: str, user: dict = Depends(verify_token)):
 
 @app.get("/api/formatting/styles")
 async def get_formatting_styles():
-    """Get available formatting styles from database"""
     try:
         response = supabase.table("active_formatting_styles").select("*").order("sort_order").execute()
         
@@ -694,7 +671,6 @@ async def get_formatting_styles():
                 for style in response.data
             ]
         else:
-            # Fallback to mock data if database is empty
             return FORMATTING_STYLES
             
     except Exception as e:
@@ -703,7 +679,6 @@ async def get_formatting_styles():
 
 @app.get("/api/formatting/variants")
 async def get_english_variants():
-    """Get available English variants from database"""
     try:
         response = supabase.table("active_english_variants").select("*").order("sort_order").execute()
         
@@ -717,7 +692,6 @@ async def get_english_variants():
                 for variant in response.data
             ]
         else:
-            # Fallback to mock data if database is empty
             return ENGLISH_VARIANTS
             
     except Exception as e:
@@ -728,7 +702,6 @@ async def get_english_variants():
 
 @app.get("/api/jobs")
 async def list_jobs():
-    """List all jobs (for testing)"""
     return {
         "jobs": list(jobs_storage.values()),
         "total": len(jobs_storage)
@@ -736,7 +709,6 @@ async def list_jobs():
 
 @app.delete("/api/jobs/{job_id}")
 async def delete_job(job_id: str):
-    """Delete a job (for testing)"""
     if job_id in jobs_storage:
         del jobs_storage[job_id]
         return {"success": True, "message": "Job deleted"}
@@ -744,7 +716,6 @@ async def delete_job(job_id: str):
 
 @app.get("/api/files")
 async def list_files():
-    """List all uploaded files (for testing)"""
     return {
         "files": list(files_storage.values()),
         "total": len(files_storage)
